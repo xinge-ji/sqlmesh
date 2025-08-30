@@ -6,9 +6,15 @@ import typing as t
 from pathlib import Path
 from unittest.mock import patch
 
+from sqlmesh.dbt.util import DBT_VERSION
+
 import pytest
 from dbt.adapters.base import BaseRelation
-from dbt.exceptions import CompilationError
+
+if DBT_VERSION >= (1, 4, 0):
+    from dbt.exceptions import CompilationError
+else:
+    from dbt.exceptions import CompilationException as CompilationError  # type: ignore
 import time_machine
 from pytest_mock.plugin import MockerFixture
 from sqlglot import exp, parse_one
@@ -47,8 +53,14 @@ from sqlmesh.dbt.context import DbtContext
 from sqlmesh.dbt.model import Materialization, ModelConfig
 from sqlmesh.dbt.project import Project
 from sqlmesh.dbt.relation import Policy
-from sqlmesh.dbt.seed import SeedConfig, Integer
-from sqlmesh.dbt.target import BigQueryConfig, DuckDbConfig, SnowflakeConfig, ClickhouseConfig
+from sqlmesh.dbt.seed import SeedConfig
+from sqlmesh.dbt.target import (
+    BigQueryConfig,
+    DuckDbConfig,
+    SnowflakeConfig,
+    ClickhouseConfig,
+    PostgresConfig,
+)
 from sqlmesh.dbt.test import TestConfig
 from sqlmesh.utils.errors import ConfigError, MacroEvalError, SQLMeshError
 from sqlmesh.utils.jinja import MacroReference
@@ -56,9 +68,9 @@ from sqlmesh.utils.jinja import MacroReference
 pytestmark = [pytest.mark.dbt, pytest.mark.slow]
 
 
-def test_model_name():
+def test_model_name(dbt_dummy_postgres_config: PostgresConfig):
     context = DbtContext()
-    context._target = DuckDbConfig(name="duckdb", schema="foo")
+    context._target = dbt_dummy_postgres_config
     assert ModelConfig(schema="foo", path="models/bar.sql").canonical_name(context) == "foo.bar"
     assert (
         ModelConfig(schema="foo", path="models/bar.sql", alias="baz").canonical_name(context)
@@ -66,9 +78,8 @@ def test_model_name():
     )
     assert (
         ModelConfig(
-            database="memory", schema="foo", path="models/bar.sql", alias="baz"
+            database="dbname", schema="foo", path="models/bar.sql", alias="baz"
         ).canonical_name(context)
-        == "foo.baz"
         == "foo.baz"
     )
     assert (
@@ -597,7 +608,10 @@ def test_model_columns():
         name="target", schema="test", database="test", account="foo", user="bar", password="baz"
     )
     sqlmesh_model = model.to_sqlmesh(context)
-    assert sqlmesh_model.columns_to_types == expected_column_types
+
+    # Columns being present in a schema.yaml are not respected in DDLs, so SQLMesh doesn't
+    # set the corresponding columns_to_types_ attribute either to match dbt's behavior
+    assert sqlmesh_model.columns_to_types == None
     assert sqlmesh_model.column_descriptions == expected_column_descriptions
 
 
@@ -612,8 +626,11 @@ def test_seed_columns():
         },
     )
 
+    # dbt doesn't respect the data_type field in the DDLs– instead, it optionally uses it to
+    # validate the actual data types at runtime through contracts or external plugins. Thus,
+    # the actual data type is int, because that is what is inferred from the seed file.
     expected_column_types = {
-        "id": exp.DataType.build("text"),
+        "id": exp.DataType.build("int"),
         "name": exp.DataType.build("text"),
     }
     expected_column_descriptions = {
@@ -660,6 +677,27 @@ def test_seed_column_types():
     assert sqlmesh_seed.columns_to_types == expected_column_types
     assert sqlmesh_seed.column_descriptions == expected_column_descriptions
 
+    seed = SeedConfig(
+        name="foo",
+        package="package",
+        path=Path("examples/sushi_dbt/seeds/waiter_names.csv"),
+        column_types={
+            "name": "text",
+        },
+        columns={
+            # The `data_type` field does not affect the materialized seed's column type
+            "id": ColumnConfig(name="name", data_type="text"),
+        },
+        quote_columns=True,
+    )
+
+    expected_column_types = {
+        "id": exp.DataType.build("int"),
+        "name": exp.DataType.build("text"),
+    }
+    sqlmesh_seed = seed.to_sqlmesh(context)
+    assert sqlmesh_seed.columns_to_types == expected_column_types
+
 
 def test_seed_column_inference(tmp_path):
     seed_csv = tmp_path / "seed.csv"
@@ -680,13 +718,42 @@ def test_seed_column_inference(tmp_path):
     context.target = DuckDbConfig(name="target", schema="test")
     sqlmesh_seed = seed.to_sqlmesh(context)
     assert sqlmesh_seed.columns_to_types == {
-        "int_col": exp.DataType.build("int"),
+        "int_col": exp.DataType.build("int")
+        if DBT_VERSION >= (1, 8, 0)
+        else exp.DataType.build("double"),
         "double_col": exp.DataType.build("double"),
         "datetime_col": exp.DataType.build("datetime"),
         "date_col": exp.DataType.build("date"),
         "boolean_col": exp.DataType.build("boolean"),
         "text_col": exp.DataType.build("text"),
     }
+
+
+def test_seed_single_whitespace_is_na(tmp_path):
+    seed_csv = tmp_path / "seed.csv"
+    with open(seed_csv, "w", encoding="utf-8") as fd:
+        fd.write("col_a, col_b\n")
+        fd.write(" ,1\n")
+        fd.write("2, \n")
+
+    seed = SeedConfig(
+        name="test_model",
+        package="foo",
+        path=Path(seed_csv),
+    )
+
+    context = DbtContext()
+    context.project_name = "foo"
+    context.target = DuckDbConfig(name="target", schema="test")
+    sqlmesh_seed = seed.to_sqlmesh(context)
+    assert sqlmesh_seed.columns_to_types == {
+        "col_a": exp.DataType.build("int"),
+        "col_b": exp.DataType.build("int"),
+    }
+
+    df = next(sqlmesh_seed.render_seed())
+    assert df["col_a"].to_list() == [None, 2]
+    assert df["col_b"].to_list() == [1, None]
 
 
 def test_seed_partial_column_inference(tmp_path):
@@ -766,6 +833,12 @@ def test_seed_column_order(tmp_path):
 
 
 def test_agate_integer_cast():
+    # Not all dbt versions have agate.Integer
+    if DBT_VERSION < (1, 7, 0):
+        pytest.skip("agate.Integer not available")
+
+    from sqlmesh.dbt.seed import Integer
+
     agate_integer = Integer(null_values=("null", ""))
     assert agate_integer.cast("1") == 1
     assert agate_integer.cast(1) == 1
@@ -1284,6 +1357,23 @@ def test_partition_by(sushi_test_project: Project):
 
 
 @pytest.mark.xdist_group("dbt_manifest")
+def test_partition_by_none(sushi_test_project: Project):
+    context = sushi_test_project.context
+    context.target = BigQueryConfig(name="production", database="main", schema="sushi")
+    model_config = ModelConfig(
+        name="model",
+        alias="model",
+        schema="test",
+        package_name="package",
+        materialized="table",
+        unique_key="ds",
+        partition_by=None,
+        sql="""SELECT 1 AS one, ds FROM foo""",
+    )
+    assert model_config.partition_by is None
+
+
+@pytest.mark.xdist_group("dbt_manifest")
 def test_relation_info_to_relation():
     assert _relation_info_to_relation(
         {"quote_policy": {}},
@@ -1344,6 +1434,29 @@ def test_is_incremental(sushi_test_project: Project, assert_exp_eq, mocker):
     assert_exp_eq(
         model_config.to_sqlmesh(context).render_query_or_raise(snapshot=snapshot).sql(),
         'SELECT 1 AS "one" FROM "tbl_a" AS "tbl_a" WHERE "ds" > (SELECT MAX("ds") FROM "model" AS "model")',
+    )
+
+    # If the snapshot_table_exists flag was set to False, intervals should be ignored
+    assert_exp_eq(
+        model_config.to_sqlmesh(context)
+        .render_query_or_raise(snapshot=snapshot, snapshot_table_exists=False)
+        .sql(),
+        'SELECT 1 AS "one" FROM "tbl_a" AS "tbl_a"',
+    )
+
+    # If the snapshot_table_exists flag was set to True, intervals should be taken into account
+    assert_exp_eq(
+        model_config.to_sqlmesh(context)
+        .render_query_or_raise(snapshot=snapshot, snapshot_table_exists=True)
+        .sql(),
+        'SELECT 1 AS "one" FROM "tbl_a" AS "tbl_a" WHERE "ds" > (SELECT MAX("ds") FROM "model" AS "model")',
+    )
+    snapshot.intervals = []
+    assert_exp_eq(
+        model_config.to_sqlmesh(context)
+        .render_query_or_raise(snaspshot=snapshot, snapshot_table_exists=True)
+        .sql(),
+        'SELECT 1 AS "one" FROM "tbl_a" AS "tbl_a"',
     )
 
 

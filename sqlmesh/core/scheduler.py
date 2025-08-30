@@ -20,6 +20,7 @@ from sqlmesh.core.snapshot import (
     DeployabilityIndex,
     Snapshot,
     SnapshotId,
+    SnapshotIdBatch,
     SnapshotEvaluator,
     apply_auto_restatements,
     earliest_start_date,
@@ -457,17 +458,6 @@ class Scheduler:
             audit_only=audit_only,
         )
 
-        snapshots_to_create = {
-            s.snapshot_id
-            for s in self.snapshot_evaluator.get_snapshots_to_create(
-                selected_snapshots, deployability_index
-            )
-        }
-
-        dag = self._dag(
-            batched_intervals, snapshot_dag=snapshot_dag, snapshots_to_create=snapshots_to_create
-        )
-
         if run_environment_statements:
             environment_statements = self.state_sync.get_environment_statements(
                 environment_naming_info.name
@@ -483,6 +473,17 @@ class Scheduler:
                 end=end,
                 execution_time=execution_time,
             )
+
+        snapshots_to_create = {
+            s.snapshot_id
+            for s in self.snapshot_evaluator.get_snapshots_to_create(
+                selected_snapshots, deployability_index
+            )
+        }
+
+        dag = self._dag(
+            batched_intervals, snapshot_dag=snapshot_dag, snapshots_to_create=snapshots_to_create
+        )
 
         def run_node(node: SchedulingUnit) -> None:
             if circuit_breaker and circuit_breaker():
@@ -531,6 +532,11 @@ class Scheduler:
                 finally:
                     num_audits = len(audit_results)
                     num_audits_failed = sum(1 for result in audit_results if result.count)
+
+                    execution_stats = self.snapshot_evaluator.execution_tracker.get_execution_stats(
+                        SnapshotIdBatch(snapshot_id=snapshot.snapshot_id, batch_id=node.batch_index)
+                    )
+
                     self.console.update_snapshot_evaluation_progress(
                         snapshot,
                         batched_intervals[snapshot][node.batch_index],
@@ -538,6 +544,7 @@ class Scheduler:
                         evaluation_duration_ms,
                         num_audits - num_audits_failed,
                         num_audits_failed,
+                        execution_stats=execution_stats,
                         auto_restatement_triggers=auto_restatement_triggers.get(
                             snapshot.snapshot_id
                         ),

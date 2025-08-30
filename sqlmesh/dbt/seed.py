@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-import copy
 import typing as t
 
 import agate
 
-try:
+from sqlmesh.dbt.util import DBT_VERSION
+
+if DBT_VERSION >= (1, 8, 0):
     from dbt_common.clients import agate_helper  # type: ignore
 
     SUPPORTS_DELIMITER = True
-except ImportError:
+else:
     from dbt.clients import agate_helper  # type: ignore
 
     SUPPORTS_DELIMITER = False
@@ -17,6 +18,7 @@ from sqlglot import exp
 
 from sqlmesh.core.config.common import VirtualEnvironmentMode
 from sqlmesh.core.model import Model, SeedKind, create_seed_model
+from sqlmesh.core.model.seed import CsvSettings
 from sqlmesh.dbt.basemodel import BaseModelConfig
 from sqlmesh.dbt.column import ColumnConfig
 
@@ -47,15 +49,11 @@ class SeedConfig(BaseModelConfig):
         """Converts the dbt seed into a SQLMesh model."""
         seed_path = self.path.absolute().as_posix()
 
-        if column_types := self.column_types:
-            column_types_override = copy.deepcopy(self.columns)
-            for name, data_type in column_types.items():
-                column = column_types_override.setdefault(name, ColumnConfig(name=name))
-                column.data_type = data_type
-                column.quote = self.quote_columns or column.quote
-                kwargs = self.sqlmesh_model_kwargs(context, column_types_override)
-        else:
-            kwargs = self.sqlmesh_model_kwargs(context)
+        column_types_override = {
+            name: ColumnConfig(name=name, data_type=data_type, quote=self.quote_columns)
+            for name, data_type in (self.column_types or {}).items()
+        }
+        kwargs = self.sqlmesh_model_kwargs(context, column_types_override)
 
         columns = kwargs.get("columns") or {}
 
@@ -80,37 +78,21 @@ class SeedConfig(BaseModelConfig):
 
         kwargs["columns"] = new_columns
 
+        # dbt treats single whitespace as a null value
+        csv_settings = CsvSettings(na_values=[" "], keep_default_na=True)
+
         return create_seed_model(
             self.canonical_name(context),
-            SeedKind(path=seed_path),
+            SeedKind(path=seed_path, csv_settings=csv_settings),
             dialect=self.dialect(context),
             audit_definitions=audit_definitions,
             virtual_environment_mode=virtual_environment_mode,
+            start=self.start or context.sqlmesh_config.model_defaults.start,
             **kwargs,
         )
 
 
-class Integer(agate_helper.Integer):
-    def cast(self, d: t.Any) -> t.Optional[int]:
-        if isinstance(d, str):
-            # The dbt's implementation doesn't support coercion of strings to integers.
-            if d.strip().lower() in self.null_values:
-                return None
-            try:
-                return int(d)
-            except ValueError:
-                raise agate.exceptions.CastError('Can not parse value "%s" as Integer.' % d)
-        return super().cast(d)
-
-    def jsonify(self, d: t.Any) -> str:
-        return d
-
-
-agate_helper.Integer = Integer  # type: ignore
-
-
 AGATE_TYPE_MAPPING = {
-    agate_helper.Integer: exp.DataType.build("int"),
     agate_helper.Number: exp.DataType.build("double"),
     agate_helper.ISODateTime: exp.DataType.build("datetime"),
     agate.Date: exp.DataType.build("date"),
@@ -118,3 +100,25 @@ AGATE_TYPE_MAPPING = {
     agate.Boolean: exp.DataType.build("boolean"),
     agate.Text: exp.DataType.build("text"),
 }
+
+
+if DBT_VERSION >= (1, 7, 0):
+
+    class Integer(agate_helper.Integer):
+        def cast(self, d: t.Any) -> t.Optional[int]:
+            if isinstance(d, str):
+                # The dbt's implementation doesn't support coercion of strings to integers.
+                if d.strip().lower() in self.null_values:
+                    return None
+                try:
+                    return int(d)
+                except ValueError:
+                    raise agate.exceptions.CastError('Can not parse value "%s" as Integer.' % d)
+            return super().cast(d)
+
+        def jsonify(self, d: t.Any) -> str:
+            return d
+
+    agate_helper.Integer = Integer  # type: ignore
+
+    AGATE_TYPE_MAPPING[agate_helper.Integer] = exp.DataType.build("int")

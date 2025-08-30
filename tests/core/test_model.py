@@ -15,7 +15,6 @@ from sqlglot.schema import MappingSchema
 from sqlmesh.cli.project_init import init_example_project, ProjectTemplate
 from sqlmesh.core.environment import EnvironmentNamingInfo
 from sqlmesh.core.model.kind import TimeColumn, ModelKindName
-from pydantic import ValidationError
 
 from sqlmesh import CustomMaterialization, CustomKind
 from pydantic import model_validator, ValidationError
@@ -66,13 +65,7 @@ from sqlmesh.core.signal import signal
 from sqlmesh.core.snapshot import Snapshot, SnapshotChangeCategory
 from sqlmesh.utils.date import TimeLike, to_datetime, to_ds, to_timestamp
 from sqlmesh.utils.errors import ConfigError, SQLMeshError, LinterError
-from sqlmesh.utils.jinja import (
-    JinjaMacroRegistry,
-    MacroInfo,
-    MacroExtractor,
-    MacroReference,
-    SQLMESH_DBT_COMPATIBILITY_PACKAGE,
-)
+from sqlmesh.utils.jinja import JinjaMacroRegistry, MacroInfo, MacroExtractor
 from sqlmesh.utils.metaprogramming import Executable, SqlValue
 from sqlmesh.core.macros import RuntimeStage
 from tests.utils.test_helpers import use_terminal_console
@@ -2566,11 +2559,15 @@ def test_parse(assert_exp_eq):
           dialect '',
         );
 
+        JINJA_QUERY_BEGIN;
+
         SELECT
           id::INT AS id,
           ds
         FROM x
-        WHERE ds BETWEEN '{{ start_ds }}' AND @end_ds
+        WHERE ds BETWEEN '{{ start_ds }}' AND @end_ds;
+
+        JINJA_END;
     """
     )
     model = load_sql_based_model(expressions, dialect="hive")
@@ -2580,8 +2577,8 @@ def test_parse(assert_exp_eq):
     }
     assert not model.annotated
     assert model.dialect == ""
-    assert isinstance(model.query, exp.Select)
-    assert isinstance(SqlModel.parse_raw(model.json()).query, exp.Select)
+    assert isinstance(model.query, d.JinjaQuery)
+    assert isinstance(SqlModel.parse_raw(model.json()).query, d.JinjaQuery)
     assert_exp_eq(
         model.render_query(),
         """
@@ -6382,59 +6379,6 @@ def test_variables_python_model(mocker: MockerFixture) -> None:
     assert df.to_dict(orient="records") == [{"a": "test_value", "b": "default_value", "c": None}]
 
 
-def test_variables_migrated_dbt_package_macro():
-    expressions = parse(
-        """
-        MODEL(
-            name test_model,
-            kind FULL,
-        );
-
-        JINJA_QUERY_BEGIN;
-        SELECT '{{ var('TEST_VAR_A') }}' as a, '{{ test.test_macro_var() }}' as b
-        JINJA_END;
-    """,
-        default_dialect="bigquery",
-    )
-
-    jinja_macros = JinjaMacroRegistry(
-        create_builtins_module=SQLMESH_DBT_COMPATIBILITY_PACKAGE,
-        packages={
-            "test": {
-                "test_macro_var": MacroInfo(
-                    definition="""
-                    {% macro test_macro_var() %}
-                        {{- var('test_var_b', __dbt_package='test') }}
-                    {%- endmacro %}""",
-                    depends_on=[MacroReference(name="var")],
-                )
-            }
-        },
-    )
-
-    model = load_sql_based_model(
-        expressions,
-        variables={
-            "test_var_a": "test_var_a_value",
-            c.MIGRATED_DBT_PACKAGES: {
-                "test": {"test_var_b": "test_var_b_value", "unused": "unused_value"},
-            },
-            "test_var_c": "test_var_c_value",
-        },
-        jinja_macros=jinja_macros,
-        migrated_dbt_project_name="test",
-        dialect="bigquery",
-    )
-    assert model.python_env[c.SQLMESH_VARS] == Executable.value(
-        {"test_var_a": "test_var_a_value", "__dbt_packages__.test.test_var_b": "test_var_b_value"},
-        sort_root_dict=True,
-    )
-    assert (
-        model.render_query().sql(dialect="bigquery")
-        == "SELECT 'test_var_a_value' AS `a`, 'test_var_b_value' AS `b`"
-    )
-
-
 def test_load_external_model_python(sushi_context) -> None:
     @model(
         "test_load_external_model_python",
@@ -8144,37 +8088,6 @@ materialized FALSE
 materialized TRUE
 )"""
     )
-
-
-def test_incremental_by_unique_key_batch_concurrency():
-    with pytest.raises(ValidationError, match=r"Input should be 1"):
-        load_sql_based_model(
-            d.parse("""
-        MODEL (
-            name db.table,
-            kind INCREMENTAL_BY_UNIQUE_KEY (
-                unique_key a,
-                batch_concurrency 2
-            )
-        );
-        select 1;
-        """)
-        )
-
-    model = load_sql_based_model(
-        d.parse("""
-        MODEL (
-            name db.table,
-            kind INCREMENTAL_BY_UNIQUE_KEY (
-                unique_key a,
-                batch_concurrency 1
-            )
-        );
-        select 1;
-        """)
-    )
-    assert isinstance(model.kind, IncrementalByUniqueKeyKind)
-    assert model.kind.batch_concurrency == 1
 
 
 def test_bad_model_kind():
@@ -9997,6 +9910,61 @@ def test_seed_coerce_datetime(tmp_path):
     assert df["bad_datetime"].iloc[0] == "9999-12-31 23:59:59"
 
 
+def test_seed_invalid_date_column(tmp_path):
+    model_csv_path = (tmp_path / "model.csv").absolute()
+
+    with open(model_csv_path, "w", encoding="utf-8") as fd:
+        fd.write("bad_date\n9999-12-31\n2025-01-01\n1000-01-01")
+
+    expressions = d.parse(
+        f"""
+        MODEL (
+            name db.seed,
+            kind SEED (
+              path '{str(model_csv_path)}',
+            ),
+            columns (
+              bad_date date,
+            ),
+        );
+    """
+    )
+
+    model = load_sql_based_model(expressions, path=Path("./examples/sushi/models/test_model.sql"))
+    df = next(model.render(context=None))
+    # The conversion to date should not raise an error
+    assert df["bad_date"].to_list() == ["9999-12-31", "2025-01-01", "1000-01-01"]
+
+
+def test_seed_missing_columns(tmp_path):
+    model_csv_path = (tmp_path / "model.csv").absolute()
+
+    with open(model_csv_path, "w", encoding="utf-8") as fd:
+        fd.write("key,value\n1,2\n3,4")
+
+    expressions = d.parse(
+        f"""
+        MODEL (
+            name db.seed,
+            kind SEED (
+              path '{str(model_csv_path)}',
+            ),
+            columns (
+              key int,
+              value int,
+              missing_column int,
+            ),
+        );
+    """
+    )
+
+    model = load_sql_based_model(expressions, path=Path("./examples/sushi/models/test_model.sql"))
+    with pytest.raises(
+        ConfigError, match="Seed model 'db.seed' has missing columns: {'missing_column'}.*"
+    ):
+        next(model.render(context=None))
+
+
 def test_missing_column_data_in_columns_key():
     expressions = d.parse(
         """
@@ -11488,3 +11456,18 @@ def test_text_diff_optimize_query():
     diff = model1.text_diff(model2)
     assert diff, "Expected diff to show optimize_query change"
     assert "+  optimize_query" in diff.lower()
+
+
+def test_raw_jinja_raw_tag():
+    expressions = d.parse(
+        """
+        MODEL (name test);
+
+        JINJA_QUERY_BEGIN;
+        SELECT {% raw %} '{{ foo }}' {% endraw %} AS col;
+        JINJA_END;
+        """
+    )
+
+    model = load_sql_based_model(expressions)
+    assert model.render_query().sql() == "SELECT '{{ foo }}' AS \"col\""

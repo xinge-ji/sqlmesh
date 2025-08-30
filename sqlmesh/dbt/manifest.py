@@ -8,14 +8,22 @@ import re
 import typing as t
 from argparse import Namespace
 from collections import defaultdict
+from functools import cached_property
 from pathlib import Path
 
 from dbt import constants as dbt_constants, flags
 
+from sqlmesh.dbt.util import DBT_VERSION
 from sqlmesh.utils.conversions import make_serializable
 
 # Override the file name to prevent dbt commands from invalidating the cache.
-dbt_constants.PARTIAL_PARSE_FILE_NAME = "sqlmesh_partial_parse.msgpack"
+
+if DBT_VERSION >= (1, 6, 0):
+    dbt_constants.PARTIAL_PARSE_FILE_NAME = "sqlmesh_partial_parse.msgpack"  # type: ignore
+else:
+    from dbt.parser import manifest as dbt_manifest  # type: ignore
+
+    dbt_manifest.PARTIAL_PARSE_FILE_NAME = "sqlmesh_partial_parse.msgpack"  # type: ignore
 
 import jinja2
 from dbt.adapters.factory import register_adapter, reset_adapters
@@ -71,6 +79,13 @@ HookConfigs = t.Dict[str, HookConfig]
 
 IGNORED_PACKAGES = {"elementary"}
 BUILTIN_CALLS = {*BUILTIN_GLOBALS, *BUILTIN_FILTERS}
+
+# Patch Semantic Manifest to skip validation and avoid Pydantic v1 errors on DBT 1.6
+# We patch for 1.7+ since we don't care about semantic models
+if DBT_VERSION >= (1, 6, 0):
+    from dbt.contracts.graph.semantic_manifest import SemanticManifest  # type: ignore
+
+    SemanticManifest.validate = lambda _: True  # type: ignore
 
 
 class ManifestHelper:
@@ -158,7 +173,7 @@ class ManifestHelper:
                 result[package_name][macro_name] = macro_config.info
         return result
 
-    @property
+    @cached_property
     def flat_graph(self) -> t.Dict[str, t.Any]:
         return {
             "exposures": {
@@ -378,11 +393,17 @@ class ManifestHelper:
 
                 if "on-run-start" in node.tags:
                     self._on_run_start_per_package[node.package_name][node_name] = HookConfig(
-                        sql=sql, index=node.index or 0, path=node_path, dependencies=dependencies
+                        sql=sql,
+                        index=getattr(node, "index", None) or 0,
+                        path=node_path,
+                        dependencies=dependencies,
                     )
                 else:
                     self._on_run_end_per_package[node.package_name][node_name] = HookConfig(
-                        sql=sql, index=node.index or 0, path=node_path, dependencies=dependencies
+                        sql=sql,
+                        index=getattr(node, "index", None) or 0,
+                        path=node_path,
+                        dependencies=dependencies,
                     )
 
     @property
@@ -442,6 +463,8 @@ class ManifestHelper:
             register_adapter(runtime_config)  # type: ignore
 
         manifest = ManifestLoader.get_full_manifest(runtime_config)
+        # This adapter doesn't care about semantic models so we clear them out to avoid issues
+        manifest.semantic_models = {}
         reset_adapters()
         return manifest
 
@@ -598,6 +621,9 @@ def _macro_references(
     manifest: Manifest, node: t.Union[ManifestNode, Macro]
 ) -> t.Set[MacroReference]:
     result: t.Set[MacroReference] = set()
+    if not hasattr(node, "depends_on"):
+        return result
+
     for macro_node_id in node.depends_on.macros:
         if not macro_node_id:
             continue
@@ -613,18 +639,20 @@ def _macro_references(
 
 def _refs(node: ManifestNode) -> t.Set[str]:
     if DBT_VERSION >= (1, 5, 0):
-        result = set()
+        result: t.Set[str] = set()
+        if not hasattr(node, "refs"):
+            return result
         for r in node.refs:
-            ref_name = f"{r.package}.{r.name}" if r.package else r.name
+            ref_name = f"{r.package}.{r.name}" if r.package else r.name  # type: ignore
             if getattr(r, "version", None):
-                ref_name = f"{ref_name}_v{r.version}"
+                ref_name = f"{ref_name}_v{r.version}"  # type: ignore
             result.add(ref_name)
         return result
     return {".".join(r) for r in node.refs}  # type: ignore
 
 
 def _sources(node: ManifestNode) -> t.Set[str]:
-    return {".".join(s) for s in node.sources}
+    return {".".join(s) for s in getattr(node, "sources", [])}
 
 
 def _model_node_id(model_name: str, package: str) -> str:
@@ -654,12 +682,17 @@ def _node_base_config(node: ManifestNode) -> t.Dict[str, t.Any]:
 
 
 def _convert_jinja_test_to_macro(test_jinja: str) -> str:
-    TEST_TAG_REGEX = r"\s*{%\s*test\s+"
-    ENDTEST_REGEX = r"{%\s*endtest\s*%}"
+    TEST_TAG_REGEX = r"\s*{%-?\s*test\s+"
+    ENDTEST_REGEX = r"{%-?\s*endtest\s*-?%}"
+
     match = re.match(TEST_TAG_REGEX, test_jinja)
     if not match:
         # already a macro
         return test_jinja
 
-    macro = "{% macro test_" + test_jinja[match.span()[-1] :]
-    return re.sub(ENDTEST_REGEX, "{% endmacro %}", macro)
+    test_tag = test_jinja[: match.span()[-1]]
+
+    macro_tag = re.sub(r"({%-?\s*)test\s+", r"\1macro test_", test_tag)
+    macro = macro_tag + test_jinja[match.span()[-1] :]
+
+    return re.sub(ENDTEST_REGEX, lambda m: m.group(0).replace("endtest", "endmacro"), macro)

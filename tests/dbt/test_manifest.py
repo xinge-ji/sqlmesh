@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pytest
 
+from sqlmesh.core.config import ModelDefaultsConfig
 from sqlmesh.dbt.basemodel import Dependencies
 from sqlmesh.dbt.context import DbtContext
-from sqlmesh.dbt.manifest import ManifestHelper
+from sqlmesh.dbt.manifest import ManifestHelper, _convert_jinja_test_to_macro
 from sqlmesh.dbt.profile import Profile
 from sqlmesh.dbt.builtin import Api, _relation_info_to_relation
 from sqlmesh.dbt.util import DBT_VERSION
@@ -24,7 +25,7 @@ def test_manifest_helper(caplog):
         project_path,
         "sushi",
         profile.target,
-        variable_overrides={"start": "2020-01-01"},
+        model_defaults=ModelDefaultsConfig(start="2020-01-01"),
     )
 
     models = helper.models()
@@ -33,7 +34,11 @@ def test_manifest_helper(caplog):
         refs={"sushi.waiter_revenue_by_day", "waiter_revenue_by_day"},
         variables={"top_waiters:revenue", "top_waiters:limit"},
         model_attrs={"columns", "config"},
-        macros=[MacroReference(name="ref"), MacroReference(name="var")],
+        macros=[
+            MacroReference(name="get_top_waiters_limit"),
+            MacroReference(name="ref"),
+            MacroReference(name="var"),
+        ],
     )
     assert models["top_waiters"].materialized == "view"
     assert models["top_waiters"].dialect_ == "postgres"
@@ -62,9 +67,12 @@ def test_manifest_helper(caplog):
     assert models["items_no_hard_delete_snapshot"].invalidate_hard_deletes is False
 
     # Test versioned models
-    assert models["waiter_revenue_by_day_v1"].version == 1
-    assert models["waiter_revenue_by_day_v2"].version == 2
-    assert "waiter_revenue_by_day" not in models
+    if DBT_VERSION >= (1, 5, 0):
+        assert models["waiter_revenue_by_day_v1"].version == 1
+        assert models["waiter_revenue_by_day_v2"].version == 2
+        assert "waiter_revenue_by_day" not in models
+    else:
+        assert "waiter_revenue_by_day" in models
 
     waiter_as_customer_by_day_config = models["waiter_as_customer_by_day"]
     assert waiter_as_customer_by_day_config.dependencies == Dependencies(
@@ -76,7 +84,10 @@ def test_manifest_helper(caplog):
     assert waiter_as_customer_by_day_config.cluster_by == ["ds"]
     assert waiter_as_customer_by_day_config.time_column == "ds"
 
-    waiter_revenue_by_day_config = models["waiter_revenue_by_day_v2"]
+    if DBT_VERSION >= (1, 5, 0):
+        waiter_revenue_by_day_config = models["waiter_revenue_by_day_v2"]
+    else:
+        waiter_revenue_by_day_config = models["waiter_revenue_by_day"]
     assert waiter_revenue_by_day_config.dependencies == Dependencies(
         macros={
             MacroReference(name="dynamic_var_name_dependency"),
@@ -135,7 +146,7 @@ def test_tests_referencing_disabled_models():
         project_path,
         "sushi",
         profile.target,
-        variable_overrides={"start": "2020-01-01"},
+        model_defaults=ModelDefaultsConfig(start="2020-01-01"),
     )
 
     assert "disabled_model" not in helper.models()
@@ -151,7 +162,7 @@ def test_call_cache():
         project_path,
         "sushi",
         profile.target,
-        variable_overrides={"start": "2020-01-01"},
+        model_defaults=ModelDefaultsConfig(start="2020-01-01"),
     )
 
     unused = "0000"
@@ -172,16 +183,17 @@ def test_variable_override():
         project_path,
         "sushi",
         profile.target,
-        variable_overrides={"start": "2020-01-01"},
+        model_defaults=ModelDefaultsConfig(start="2020-01-01"),
     )
-    assert helper.models()["top_waiters"].limit_value == 10
+    assert helper.models()["top_waiters"].limit_value.strip() == "10"
 
     helper = ManifestHelper(
         project_path,
         project_path,
         "sushi",
         profile.target,
-        variable_overrides={"top_waiters:limit": 1, "start": "2020-01-01"},
+        variable_overrides={"top_waiters:limit": 1},
+        model_defaults=ModelDefaultsConfig(start="2020-01-01"),
     )
     assert helper.models()["top_waiters"].limit_value == 1
 
@@ -196,7 +208,7 @@ def test_source_meta_external_location():
         project_path,
         "sushi",
         profile.target,
-        variable_overrides={"start": "2020-01-01"},
+        model_defaults=ModelDefaultsConfig(start="2020-01-01"),
     )
 
     sources = helper.sources()
@@ -216,7 +228,12 @@ def test_source_meta_external_location():
         sources["parquet_file.items"].relation_info, api.Relation, api.quote_policy
     )
     assert relation.identifier == "items"
-    assert relation.render() == "read_parquet('path/to/external/items.parquet')"
+    expected = (
+        "read_parquet('path/to/external/items.parquet')"
+        if DBT_VERSION >= (1, 4, 0)
+        else '"main"."parquet_file".items'
+    )
+    assert relation.render() == expected
 
 
 @pytest.mark.xdist_group("dbt_manifest")
@@ -229,7 +246,7 @@ def test_top_level_dbt_adapter_macros():
         project_path,
         "sushi",
         profile.target,
-        variable_overrides={"start": "2020-01-01"},
+        model_defaults=ModelDefaultsConfig(start="2020-01-01"),
     )
 
     # Adapter macros must be marked as top-level
@@ -244,3 +261,45 @@ def test_top_level_dbt_adapter_macros():
     customers_macros = helper.macros("customers")
     assert not customers_macros["default__current_engine"].info.is_top_level
     assert not customers_macros["duckdb__current_engine"].info.is_top_level
+
+
+def test_convert_jinja_test_to_macro():
+    # Test block with whitespace trimming
+    test_input = """{%- test assert_positive(model, column_name) -%}
+    select * from {{ model }} where {{ column_name }} <= 0
+{%- endtest -%}"""
+
+    expected_output = """{%- macro test_assert_positive(model, column_name) -%}
+    select * from {{ model }} where {{ column_name }} <= 0
+{%- endmacro -%}"""
+
+    assert _convert_jinja_test_to_macro(test_input) == expected_output
+
+    # Test block without whitespace trimming
+    test_input_no_ws = """{% test assert_positive(model, column_name) %}
+    select * from {{ model }} where {{ column_name }} <= 0
+{% endtest %}"""
+
+    expected_output_no_ws = """{% macro test_assert_positive(model, column_name) %}
+    select * from {{ model }} where {{ column_name }} <= 0
+{% endmacro %}"""
+
+    assert _convert_jinja_test_to_macro(test_input_no_ws) == expected_output_no_ws
+
+    # Test block with mixed whitespace trimming
+    test_input_mixed = """{%- test complex_test(model, column_name='id') %}
+    select count(*) from {{ model }} where {{ column_name }} is null
+{% endtest -%}"""
+
+    expected_output_mixed = """{%- macro test_complex_test(model, column_name='id') %}
+    select count(*) from {{ model }} where {{ column_name }} is null
+{% endmacro -%}"""
+
+    assert _convert_jinja_test_to_macro(test_input_mixed) == expected_output_mixed
+
+    # Test already converted macro (should return unchanged)
+    macro_input = """{%- macro test_already_converted(model) -%}
+    select * from {{ model }}
+{%- endmacro -%}"""
+
+    assert _convert_jinja_test_to_macro(macro_input) == macro_input

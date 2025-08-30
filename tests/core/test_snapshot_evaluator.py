@@ -1,7 +1,7 @@
 from __future__ import annotations
 import typing as t
 from typing_extensions import Self
-from unittest.mock import call, patch
+from unittest.mock import call, patch, Mock
 import re
 import logging
 import pytest
@@ -115,6 +115,7 @@ def adapter_mock(mocker: MockerFixture):
     adapter_mock.HAS_VIEW_BINDING = False
     adapter_mock.wap_supported.return_value = False
     adapter_mock.get_data_objects.return_value = []
+    adapter_mock.with_settings.return_value = adapter_mock
     return adapter_mock
 
 
@@ -137,6 +138,7 @@ def adapters(mocker: MockerFixture):
         adapter_mock.HAS_VIEW_BINDING = False
         adapter_mock.wap_supported.return_value = False
         adapter_mock.get_data_objects.return_value = []
+        adapter_mock.with_settings.return_value = adapter_mock
         adapters.append(adapter_mock)
     return adapters
 
@@ -470,6 +472,64 @@ def test_cleanup(mocker: MockerFixture, adapter_mock, make_snapshot):
     )
 
 
+def test_cleanup_view(adapter_mock, make_snapshot):
+    evaluator = SnapshotEvaluator(adapter_mock)
+
+    model = SqlModel(
+        name="catalog.test_schema.test_model",
+        kind=ViewKind(materialized=False),
+        query=parse_one("SELECT a FROM tbl"),
+    )
+
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING, forward_only=True)
+
+    evaluator.promote([snapshot], EnvironmentNamingInfo(name="test_env"))
+    evaluator.cleanup([SnapshotTableCleanupTask(snapshot=snapshot.table_info, dev_table_only=True)])
+
+    adapter_mock.get_data_object.assert_not_called()
+    adapter_mock.drop_view.assert_called_once_with(
+        f"catalog.sqlmesh__test_schema.test_schema__test_model__{snapshot.fingerprint.to_version()}__dev",
+        cascade=True,
+        ignore_if_not_exists=False,
+    )
+
+
+def test_cleanup_materialized_view(adapter_mock, make_snapshot):
+    evaluator = SnapshotEvaluator(adapter_mock)
+
+    model = SqlModel(
+        name="catalog.test_schema.test_model",
+        kind=ViewKind(materialized=True),
+        query=parse_one("SELECT a FROM tbl"),
+    )
+
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING, forward_only=True)
+
+    adapter_mock.drop_view.side_effect = [RuntimeError("failed to drop view"), None]
+
+    evaluator.promote([snapshot], EnvironmentNamingInfo(name="test_env"))
+    evaluator.cleanup([SnapshotTableCleanupTask(snapshot=snapshot.table_info, dev_table_only=True)])
+
+    adapter_mock.get_data_object.assert_not_called()
+    adapter_mock.drop_view.assert_has_calls(
+        [
+            call(
+                f"catalog.sqlmesh__test_schema.test_schema__test_model__{snapshot.fingerprint.to_version()}__dev",
+                cascade=True,
+                ignore_if_not_exists=False,
+            ),
+            call(
+                f"catalog.sqlmesh__test_schema.test_schema__test_model__{snapshot.fingerprint.to_version()}__dev",
+                materialized=True,
+                cascade=True,
+                ignore_if_not_exists=True,
+            ),
+        ]
+    )
+
+
 def test_cleanup_fails(adapter_mock, make_snapshot):
     adapter_mock.drop_table.side_effect = RuntimeError("test_error")
 
@@ -594,6 +654,7 @@ def test_evaluate_materialized_view_with_partitioned_by_cluster_by(
     adapter.table_exists = lambda *args, **kwargs: False  # type: ignore
     adapter.get_data_objects = lambda *args, **kwargs: []  # type: ignore
     adapter._execute = execute_mock  # type: ignore
+    adapter.with_settings = lambda **kwargs: adapter  # type: ignore
     evaluator = SnapshotEvaluator(adapter)
 
     model = SqlModel(
@@ -618,7 +679,8 @@ def test_evaluate_materialized_view_with_partitioned_by_cluster_by(
     execute_mock.assert_has_calls(
         [
             call(
-                f"CREATE MATERIALIZED VIEW `sqlmesh__test_schema`.`test_schema__test_model__{snapshot.version}` PARTITION BY `a` CLUSTER BY `b` AS SELECT `a` AS `a`, `b` AS `b` FROM `tbl` AS `tbl`"
+                f"CREATE MATERIALIZED VIEW `sqlmesh__test_schema`.`test_schema__test_model__{snapshot.version}` PARTITION BY `a` CLUSTER BY `b` AS SELECT `a` AS `a`, `b` AS `b` FROM `tbl` AS `tbl`",
+                False,
             ),
         ]
     )
@@ -933,6 +995,7 @@ def test_create_tables_exist(
 ):
     adapter_mock = mocker.patch("sqlmesh.core.engine_adapter.EngineAdapter")
     adapter_mock.dialect = "duckdb"
+    adapter_mock.with_settings.return_value = adapter_mock
 
     evaluator = SnapshotEvaluator(adapter_mock)
     snapshot.categorize_as(category=snapshot_category, forward_only=forward_only)
@@ -1135,6 +1198,7 @@ def test_create_view_with_properties(mocker: MockerFixture, adapter_mock, make_s
 def test_promote_model_info(mocker: MockerFixture, make_snapshot):
     adapter_mock = mocker.patch("sqlmesh.core.engine_adapter.EngineAdapter")
     adapter_mock.dialect = "duckdb"
+    adapter_mock.with_settings.return_value = adapter_mock
 
     evaluator = SnapshotEvaluator(adapter_mock)
 
@@ -1163,6 +1227,7 @@ def test_promote_model_info(mocker: MockerFixture, make_snapshot):
 def test_promote_deployable(mocker: MockerFixture, make_snapshot):
     adapter_mock = mocker.patch("sqlmesh.core.engine_adapter.EngineAdapter")
     adapter_mock.dialect = "duckdb"
+    adapter_mock.with_settings.return_value = adapter_mock
 
     evaluator = SnapshotEvaluator(adapter_mock)
 
@@ -1208,6 +1273,7 @@ def test_promote_deployable(mocker: MockerFixture, make_snapshot):
 
 def test_migrate(mocker: MockerFixture, make_snapshot, make_mocked_engine_adapter):
     adapter = make_mocked_engine_adapter(EngineAdapter)
+    adapter.with_settings = lambda **kwargs: adapter  # type: ignore
     session_spy = mocker.spy(adapter, "session")
 
     current_table = "sqlmesh__test_schema.test_schema__test_model__1"
@@ -1263,6 +1329,7 @@ def test_migrate(mocker: MockerFixture, make_snapshot, make_mocked_engine_adapte
 def test_migrate_missing_table(mocker: MockerFixture, make_snapshot, make_mocked_engine_adapter):
     adapter = make_mocked_engine_adapter(EngineAdapter)
     adapter.table_exists = lambda _: False  # type: ignore
+    adapter.with_settings = lambda **kwargs: adapter  # type: ignore
     mocker.patch.object(adapter, "get_data_object", return_value=None)
 
     evaluator = SnapshotEvaluator(adapter)
@@ -1331,6 +1398,7 @@ def test_migrate_snapshot_data_object_type_mismatch(
     make_mocked_engine_adapter,
 ):
     adapter = make_mocked_engine_adapter(EngineAdapter)
+    adapter.with_settings = lambda **kwargs: adapter  # type: ignore
     mocker.patch.object(
         adapter,
         "get_data_object",
@@ -1745,7 +1813,7 @@ def test_on_destructive_change_runtime_check(
     make_mocked_engine_adapter,
 ):
     adapter = make_mocked_engine_adapter(EngineAdapter)
-
+    adapter.with_settings = lambda **kwargs: adapter  # type: ignore
     current_table = "sqlmesh__test_schema.test_schema__test_model__1"
 
     def columns(table_name):
@@ -1827,7 +1895,7 @@ def test_on_additive_change_runtime_check(
     make_mocked_engine_adapter,
 ):
     adapter = make_mocked_engine_adapter(EngineAdapter)
-
+    adapter.with_settings = lambda **kwargs: adapter  # type: ignore
     current_table = "sqlmesh__test_schema.test_schema__test_model__1"
 
     def columns(table_name):
@@ -2839,7 +2907,7 @@ def test_standalone_audit(mocker: MockerFixture, adapter_mock, make_snapshot):
     adapter_mock.session.assert_not_called()
 
 
-def test_audit_wap(adapter_mock, make_snapshot):
+def test_audit_wap(adapter_mock: Mock, make_snapshot: t.Callable[..., Snapshot]) -> None:
     evaluator = SnapshotEvaluator(adapter_mock)
 
     custom_audit = ModelAudit(
@@ -3719,6 +3787,7 @@ def test_create_managed_forward_only_with_previous_version_doesnt_clone_for_dev_
 def test_migrate_snapshot(snapshot: Snapshot, mocker: MockerFixture, adapter_mock, make_snapshot):
     adapter_mock = mocker.patch("sqlmesh.core.engine_adapter.EngineAdapter")
     adapter_mock.dialect = "duckdb"
+    adapter_mock.with_settings.return_value = adapter_mock
 
     evaluator = SnapshotEvaluator(adapter_mock)
     evaluator.create([snapshot], {})
@@ -3928,6 +3997,7 @@ def test_multiple_engine_promotion(mocker: MockerFixture, adapter_mock, make_sna
     cursor_mock = mocker.Mock()
     connection_mock.cursor.return_value = cursor_mock
     adapter = EngineAdapter(lambda: connection_mock, "")
+    adapter.with_settings = lambda **kwargs: adapter  # type: ignore
     engine_adapters = {"default": adapter_mock, "secondary": adapter}
 
     def columns(table_name):
@@ -3987,7 +4057,9 @@ def test_multiple_engine_migration(
     mocker: MockerFixture, adapter_mock, make_snapshot, make_mocked_engine_adapter
 ):
     adapter_one = make_mocked_engine_adapter(EngineAdapter)
+    adapter_one.with_settings = lambda **kwargs: adapter_one  # type: ignore
     adapter_two = adapter_mock
+    adapter_two.with_settings.return_value = adapter_two
     engine_adapters = {"one": adapter_one, "two": adapter_two}
 
     current_table = "sqlmesh__test_schema.test_schema__test_model__1"
@@ -4259,3 +4331,253 @@ def test_multiple_engine_virtual_layer(snapshot: Snapshot, adapters, make_snapsh
         "test_schema__test_env.test_model",
         cascade=False,
     )
+
+
+def test_wap_basic(
+    adapter_mock: Mock, make_snapshot: t.Callable[..., Snapshot], mocker: MockerFixture
+) -> None:
+    evaluator = SnapshotEvaluator(adapter_mock)
+
+    model = SqlModel(
+        name="test_schema.test_table",
+        kind=FullKind(),
+        query=parse_one("SELECT a::int FROM tbl"),
+    )
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    adapter_mock.wap_supported.return_value = True
+
+    expected_wap_table = "test_schema.test_table.branch_wap_12345678"
+    adapter_mock.wap_prepare.return_value = expected_wap_table
+
+    wap_id = evaluator.evaluate(
+        snapshot,
+        start="2020-01-01",
+        end="2020-01-01",
+        execution_time="2020-01-01",
+        snapshots={},
+        target_table_exists=True,  # Use parameter to control table existence
+    )
+
+    assert wap_id is not None
+    assert len(wap_id) == 8
+
+    expected_table_name = snapshot.table_name()
+    adapter_mock.wap_prepare.assert_called_once_with(expected_table_name, wap_id)
+    adapter_mock.replace_query.assert_called_once_with(
+        expected_wap_table,
+        mocker.ANY,
+        table_format=mocker.ANY,
+        storage_format=mocker.ANY,
+        partitioned_by=mocker.ANY,
+        partition_interval_unit=mocker.ANY,
+        clustered_by=mocker.ANY,
+        table_properties=mocker.ANY,
+        table_description=mocker.ANY,
+        column_descriptions=mocker.ANY,
+        target_columns_to_types=mocker.ANY,
+        source_columns=mocker.ANY,
+    )
+
+
+def test_wap_model_wap_supported(
+    adapter_mock: Mock, make_snapshot: t.Callable[..., Snapshot], mocker: MockerFixture
+) -> None:
+    evaluator = SnapshotEvaluator(adapter_mock)
+
+    model = SqlModel(
+        name="test_schema.test_table",
+        kind=FullKind(),
+        query=parse_one("SELECT a::int FROM tbl"),
+        storage_format="iceberg",  # Model supports WAP via iceberg format
+    )
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    adapter_mock.wap_supported.return_value = False
+
+    expected_wap_table = "test_schema.test_table.branch_wap_12345678"
+    adapter_mock.wap_prepare.return_value = expected_wap_table
+
+    wap_id = evaluator.evaluate(
+        snapshot,
+        start="2020-01-01",
+        end="2020-01-01",
+        execution_time="2020-01-01",
+        snapshots={},
+        target_table_exists=True,  # Use parameter to control table existence
+    )
+    assert wap_id is not None
+
+    expected_table_name = snapshot.table_name()
+    adapter_mock.wap_prepare.assert_called_once_with(expected_table_name, wap_id)
+    adapter_mock.replace_query.assert_called_once_with(
+        expected_wap_table,
+        mocker.ANY,
+        table_format=mocker.ANY,
+        storage_format=mocker.ANY,
+        partitioned_by=mocker.ANY,
+        partition_interval_unit=mocker.ANY,
+        clustered_by=mocker.ANY,
+        table_properties=mocker.ANY,
+        table_description=mocker.ANY,
+        column_descriptions=mocker.ANY,
+        target_columns_to_types=mocker.ANY,
+        source_columns=mocker.ANY,
+    )
+
+
+def test_wap_no_wap_support(adapter_mock: Mock, make_snapshot: t.Callable[..., Snapshot]) -> None:
+    evaluator = SnapshotEvaluator(adapter_mock)
+
+    model = SqlModel(
+        name="test_schema.test_table",
+        kind=FullKind(),
+        query=parse_one("SELECT a::int FROM tbl"),
+    )
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    adapter_mock.wap_supported.return_value = False
+
+    wap_id = evaluator.evaluate(
+        snapshot,
+        start="2020-01-01",
+        end="2020-01-01",
+        execution_time="2020-01-01",
+        snapshots={},
+        target_table_exists=True,
+    )
+
+    assert wap_id is None
+    adapter_mock.wap_prepare.assert_not_called()
+
+
+def test_wap_non_materialized_snapshot(
+    adapter_mock: Mock, make_snapshot: t.Callable[..., Snapshot]
+) -> None:
+    evaluator = SnapshotEvaluator(adapter_mock)
+
+    model = SqlModel(
+        name="test_schema.test_table",
+        kind=ViewKind(),  # View kind is not materialized
+        query=parse_one("SELECT a::int FROM tbl"),
+    )
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    adapter_mock.wap_supported.return_value = True
+
+    wap_id = evaluator.evaluate(
+        snapshot, start="2020-01-01", end="2020-01-01", execution_time="2020-01-01", snapshots={}
+    )
+
+    assert wap_id is None
+    adapter_mock.wap_prepare.assert_not_called()
+
+
+def test_wap_publish_snapshot(adapter_mock: Mock, make_snapshot: t.Callable[..., Snapshot]) -> None:
+    evaluator = SnapshotEvaluator(adapter_mock)
+
+    model = SqlModel(
+        name="test_schema.test_table",
+        kind=FullKind(),
+        query=parse_one("SELECT a::int FROM tbl"),
+    )
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    wap_id = "test_wap_id"
+    deployability_index = DeployabilityIndex.all_deployable()
+
+    evaluator.wap_publish_snapshot(snapshot, wap_id, deployability_index)
+
+    expected_table_name = snapshot.table_name(is_deployable=True)
+    adapter_mock.wap_publish.assert_called_once_with(expected_table_name, wap_id)
+
+
+def test_wap_during_audit(adapter_mock: Mock, make_snapshot: t.Callable[..., Snapshot]) -> None:
+    evaluator = SnapshotEvaluator(adapter_mock)
+
+    custom_audit = ModelAudit(
+        name="custom_audit",
+        query="SELECT * FROM test_schema.test_table WHERE invalid_condition",
+    )
+
+    model = SqlModel(
+        name="test_schema.test_table",
+        kind=FullKind(),
+        query=parse_one("SELECT a::int FROM tbl"),
+        audits=[
+            ("not_null", {"columns": exp.to_column("a")}),
+            ("custom_audit", {}),
+        ],
+        audit_definitions={custom_audit.name: custom_audit},
+    )
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    wap_id = "test_wap_id"
+    expected_wap_table_name = f"test_schema.test_table.branch_wap_{wap_id}"
+    adapter_mock.wap_table_name.return_value = expected_wap_table_name
+    adapter_mock.fetchone.return_value = (0,)
+
+    results = evaluator.audit(snapshot, snapshots={}, wap_id=wap_id)
+
+    assert len(results) == 2
+
+    adapter_mock.wap_table_name.assert_called_once_with(snapshot.table_name(), wap_id)
+    adapter_mock.wap_publish.assert_called_once_with(snapshot.table_name(), wap_id)
+
+
+def test_wap_prepare_failure(adapter_mock: Mock, make_snapshot: t.Callable[..., Snapshot]) -> None:
+    evaluator = SnapshotEvaluator(adapter_mock)
+
+    model = SqlModel(
+        name="test_schema.test_table",
+        kind=FullKind(),
+        query=parse_one("SELECT a::int FROM tbl"),
+    )
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    adapter_mock.wap_supported.return_value = True
+
+    adapter_mock.wap_prepare.side_effect = Exception("WAP prepare failed")
+
+    with pytest.raises(Exception, match="WAP prepare failed"):
+        evaluator.evaluate(
+            snapshot,
+            start="2020-01-01",
+            end="2020-01-01",
+            execution_time="2020-01-01",
+            snapshots={},
+            target_table_exists=True,
+        )
+
+
+def test_wap_publish_failure(adapter_mock: Mock, make_snapshot: t.Callable[..., Snapshot]) -> None:
+    """Test error handling when WAP publish fails."""
+    evaluator = SnapshotEvaluator(adapter_mock)
+
+    model = SqlModel(
+        name="test_schema.test_table",
+        kind=FullKind(),
+        query=parse_one("SELECT a::int FROM tbl"),
+        audits=[("not_null", {"columns": exp.to_column("a")})],
+    )
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    wap_id = "test_wap_id"
+    expected_wap_table_name = f"test_schema.test_table.branch_wap_{wap_id}"
+    adapter_mock.wap_table_name.return_value = expected_wap_table_name
+    adapter_mock.fetchone.return_value = (0,)
+
+    # Mock WAP publish to raise an exception
+    adapter_mock.wap_publish.side_effect = Exception("WAP publish failed")
+
+    # Execute audit with WAP ID and expect it to raise the exception
+    with pytest.raises(Exception, match="WAP publish failed"):
+        evaluator.audit(snapshot, snapshots={}, wap_id=wap_id)

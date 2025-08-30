@@ -2,14 +2,33 @@ import typing as t
 import sys
 import click
 from sqlmesh_dbt.operations import DbtOperations, create
-from sqlmesh_dbt.error import cli_global_error_handler
+from sqlmesh_dbt.error import cli_global_error_handler, ErrorHandlingGroup
 from pathlib import Path
+from sqlmesh_dbt.options import YamlParamType
+import functools
 
 
-def _get_dbt_operations(ctx: click.Context) -> DbtOperations:
-    if not isinstance(ctx.obj, DbtOperations):
+def _get_dbt_operations(ctx: click.Context, vars: t.Optional[t.Dict[str, t.Any]]) -> DbtOperations:
+    if not isinstance(ctx.obj, functools.partial):
         raise ValueError(f"Unexpected click context object: {type(ctx.obj)}")
-    return ctx.obj
+
+    dbt_operations = ctx.obj(vars=vars)
+
+    if not isinstance(dbt_operations, DbtOperations):
+        raise ValueError(f"Unexpected dbt operations type: {type(dbt_operations)}")
+
+    @ctx.call_on_close
+    def _cleanup() -> None:
+        dbt_operations.close()
+
+    return dbt_operations
+
+
+vars_option = click.option(
+    "--vars",
+    type=YamlParamType(),
+    help="Supply variables to the project. This argument overrides variables defined in your dbt_project.yml file. This argument should be a YAML string, eg. '{my_variable: my_value}'",
+)
 
 
 select_option = click.option(
@@ -24,13 +43,22 @@ select_option = click.option(
 exclude_option = click.option("--exclude", multiple=True, help="Specify the nodes to exclude.")
 
 
-@click.group(invoke_without_command=True)
+@click.group(cls=ErrorHandlingGroup, invoke_without_command=True)
 @click.option("--profile", help="Which existing profile to load. Overrides output.profile")
 @click.option("-t", "--target", help="Which target to load for the given profile")
+@click.option(
+    "-d",
+    "--debug/--no-debug",
+    default=False,
+    help="Display debug logging during dbt execution. Useful for debugging and making bug reports events to help when debugging.",
+)
 @click.pass_context
 @cli_global_error_handler
 def dbt(
-    ctx: click.Context, profile: t.Optional[str] = None, target: t.Optional[str] = None
+    ctx: click.Context,
+    profile: t.Optional[str] = None,
+    target: t.Optional[str] = None,
+    debug: bool = False,
 ) -> None:
     """
     An ELT tool for managing your SQL transformations and data models, powered by the SQLMesh engine.
@@ -40,10 +68,17 @@ def dbt(
         # we dont need to import sqlmesh/load the project for CLI help
         return
 
-    # TODO: conditionally call create() if there are times we dont want/need to import sqlmesh and load a project
-    ctx.obj = create(project_dir=Path.cwd(), profile=profile, target=target)
+    # we have a partially applied function here because subcommands might set extra options like --vars
+    # that need to be known before we attempt to load the project
+    ctx.obj = functools.partial(
+        create, project_dir=Path.cwd(), profile=profile, target=target, debug=debug
+    )
 
     if not ctx.invoked_subcommand:
+        if profile or target:
+            # trigger a project load to validate the specified profile / target
+            ctx.obj()
+
         click.echo(
             f"No command specified. Run `{ctx.info_name} --help` to see the available commands."
         )
@@ -57,19 +92,34 @@ def dbt(
     "--full-refresh",
     help="If specified, dbt will drop incremental models and fully-recalculate the incremental table from the model definition.",
 )
+@click.option(
+    "--env",
+    "--environment",
+    help="Run against a specific Virtual Data Environment (VDE) instead of the main environment",
+)
+@click.option(
+    "--empty/--no-empty", default=False, help="If specified, limit input refs and sources"
+)
+@vars_option
 @click.pass_context
-def run(ctx: click.Context, **kwargs: t.Any) -> None:
+def run(
+    ctx: click.Context,
+    vars: t.Optional[t.Dict[str, t.Any]],
+    env: t.Optional[str] = None,
+    **kwargs: t.Any,
+) -> None:
     """Compile SQL and execute against the current target database."""
-    _get_dbt_operations(ctx).run(**kwargs)
+    _get_dbt_operations(ctx, vars).run(environment=env, **kwargs)
 
 
 @dbt.command(name="list")
 @select_option
 @exclude_option
+@vars_option
 @click.pass_context
-def list_(ctx: click.Context, **kwargs: t.Any) -> None:
+def list_(ctx: click.Context, vars: t.Optional[t.Dict[str, t.Any]], **kwargs: t.Any) -> None:
     """List the resources in your project"""
-    _get_dbt_operations(ctx).list_(**kwargs)
+    _get_dbt_operations(ctx, vars).list_(**kwargs)
 
 
 @dbt.command(name="ls", hidden=True)  # hidden alias for list

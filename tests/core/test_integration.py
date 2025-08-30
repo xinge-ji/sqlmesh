@@ -42,7 +42,7 @@ from sqlmesh.core.console import Console, get_console
 from sqlmesh.core.context import Context
 from sqlmesh.core.config.categorizer import CategorizerConfig
 from sqlmesh.core.config.plan import PlanConfig
-from sqlmesh.core.engine_adapter import EngineAdapter
+from sqlmesh.core.engine_adapter import EngineAdapter, DuckDBEngineAdapter
 from sqlmesh.core.environment import EnvironmentNamingInfo
 from sqlmesh.core.macros import macro
 from sqlmesh.core.model import (
@@ -2035,6 +2035,35 @@ def test_dbt_select_star_is_directly_modified(sushi_test_dbt_context: Context):
 
     assert plan.snapshots[snapshot_a_id].change_category == SnapshotChangeCategory.NON_BREAKING
     assert plan.snapshots[snapshot_b_id].change_category == SnapshotChangeCategory.NON_BREAKING
+
+
+@time_machine.travel("2023-01-08 15:00:00 UTC")
+def test_dbt_is_incremental_table_is_missing(sushi_test_dbt_context: Context):
+    context = sushi_test_dbt_context
+
+    model = context.get_model("sushi.waiter_revenue_by_day_v2")
+    model = model.copy(update={"kind": IncrementalUnmanagedKind(), "start": "2023-01-01"})
+    context.upsert_model(model)
+
+    context.plan("prod", auto_apply=True, no_prompts=True, skip_tests=True)
+
+    snapshot = context.get_snapshot("sushi.waiter_revenue_by_day_v2")
+    assert snapshot
+
+    # Manually drop the table
+    context.engine_adapter.drop_table(snapshot.table_name())
+
+    context.snapshot_evaluator.evaluate(
+        snapshot,
+        start="2023-01-01",
+        end="2023-01-08",
+        execution_time="2023-01-08 15:00:00",
+        snapshots={s.name: s for s in context.snapshots.values()},
+        deployability_index=DeployabilityIndex.all_deployable(),
+    )
+
+    # Make sure the table was recreated
+    assert context.engine_adapter.table_exists(snapshot.table_name())
 
 
 def test_model_attr(sushi_test_dbt_context: Context, assert_exp_eq):
@@ -6398,6 +6427,75 @@ Macro 'bad_macro' does not exist."""
         ctx.plan(auto_apply=True, no_prompts=True)
 
 
+def test_before_all_after_all_execution_order(tmp_path: Path, mocker: MockerFixture):
+    model = """
+    MODEL (
+        name test_schema.model_that_depends_on_before_all,
+        kind FULL,
+    );
+
+    SELECT id, value FROM before_all_created_table
+    """
+
+    models_dir = tmp_path / "models"
+    models_dir.mkdir()
+
+    with open(models_dir / "model.sql", "w") as f:
+        f.write(model)
+
+    # before_all statement that creates a table that the above model depends on
+    before_all_statement = (
+        "CREATE TABLE IF NOT EXISTS before_all_created_table AS SELECT 1 AS id, 'test' AS value"
+    )
+
+    # after_all that depends on the model
+    after_all_statement = "CREATE TABLE IF NOT EXISTS after_all_created_table AS SELECT id, value FROM test_schema.model_that_depends_on_before_all"
+
+    config = Config(
+        model_defaults=ModelDefaultsConfig(dialect="duckdb"),
+        before_all=[before_all_statement],
+        after_all=[after_all_statement],
+    )
+
+    execute_calls: t.List[str] = []
+
+    original_duckdb_execute = DuckDBEngineAdapter.execute
+
+    def track_duckdb_execute(self, expression, **kwargs):
+        sql = expression if isinstance(expression, str) else expression.sql(dialect="duckdb")
+        state_tables = [
+            "_snapshots",
+            "_environments",
+            "_versions",
+            "_intervals",
+            "_auto_restatements",
+            "_environment_statements",
+            "_plan_dags",
+        ]
+
+        # to ignore the state queries
+        if not any(table in sql.lower() for table in state_tables):
+            execute_calls.append(sql)
+
+        return original_duckdb_execute(self, expression, **kwargs)
+
+    ctx = Context(paths=[tmp_path], config=config)
+
+    # the plan would fail if the execution order ever changes and before_all statements dont execute first
+    ctx.plan(auto_apply=True, no_prompts=True)
+
+    mocker.patch.object(DuckDBEngineAdapter, "execute", track_duckdb_execute)
+
+    # run with the patched execute
+    ctx.run("prod", start="2023-01-01", end="2023-01-02")
+
+    # validate explicitly that the first execute is for the before_all
+    assert "before_all_created_table" in execute_calls[0]
+
+    # and that the last is the sole after all that depends on the model
+    assert "after_all_created_table" in execute_calls[-1]
+
+
 @time_machine.travel("2025-03-08 00:00:00 UTC")
 def test_tz(init_and_plan_context):
     context, _ = init_and_plan_context("examples/sushi")
@@ -7993,7 +8091,7 @@ def test_incremental_by_time_model_ignore_additive_change(tmp_path: Path):
         cron '@daily'
     );
 
-    SELECT 
+    SELECT
         *,
         1 as id,
         'test_name' as name,
@@ -8039,7 +8137,7 @@ def test_incremental_by_time_model_ignore_additive_change(tmp_path: Path):
                 cron '@daily'
             );
 
-            SELECT 
+            SELECT
                 *,
                 1 as id,
                 'other' as other_column,
@@ -8095,7 +8193,7 @@ def test_incremental_by_time_model_ignore_additive_change(tmp_path: Path):
                 cron '@daily'
             );
 
-            SELECT 
+            SELECT
                 *,
                 CAST(1 AS STRING) as id,
                 'other' as other_column,
@@ -8141,7 +8239,7 @@ def test_incremental_by_time_model_ignore_additive_change(tmp_path: Path):
                 cron '@daily'
             );
 
-            SELECT 
+            SELECT
                 *,
                 CAST(1 AS STRING) as id,
                 'other' as other_column,
@@ -8315,7 +8413,7 @@ def test_incremental_by_unique_key_model_ignore_additive_change(tmp_path: Path):
         cron '@daily'
     );
 
-    SELECT 
+    SELECT
         *,
         1 as id,
         'test_name' as name,
@@ -8360,7 +8458,7 @@ def test_incremental_by_unique_key_model_ignore_additive_change(tmp_path: Path):
                 cron '@daily'
             );
 
-            SELECT 
+            SELECT
                 *,
                 2 as id,
                 3 as new_column,
@@ -8537,7 +8635,7 @@ def test_incremental_unmanaged_model_ignore_additive_change(tmp_path: Path):
         cron '@daily'
     );
 
-    SELECT 
+    SELECT
         *,
         1 as id,
         'test_name' as name,
@@ -8581,7 +8679,7 @@ def test_incremental_unmanaged_model_ignore_additive_change(tmp_path: Path):
             );
 
             SELECT
-                *, 
+                *,
                 2 as id,
                 3 as new_column,
                 @start_ds as ds
@@ -8991,7 +9089,7 @@ def test_scd_type_2_by_column_ignore_additive_change(tmp_path: Path):
             cron '@daily'
         );
 
-        SELECT 
+        SELECT
             *,
             1 as id,
             'test_name' as name,
@@ -9038,7 +9136,7 @@ def test_scd_type_2_by_column_ignore_additive_change(tmp_path: Path):
         );
 
         SELECT
-            *, 
+            *,
             1 as id,
             'stable2' as stable,
             3 as new_column,
@@ -9218,7 +9316,7 @@ def test_incremental_partition_ignore_additive_change(tmp_path: Path):
             cron '@daily'
         );
 
-        SELECT 
+        SELECT
             *,
             1 as id,
             'test_name' as name,
@@ -9263,7 +9361,7 @@ def test_incremental_partition_ignore_additive_change(tmp_path: Path):
         );
 
         SELECT
-            *, 
+            *,
             1 as id,
             3 as new_column,
             @start_ds as ds
@@ -9497,7 +9595,7 @@ def test_incremental_by_time_model_ignore_additive_change_unit_test(tmp_path: Pa
         cron '@daily'
     );
 
-    SELECT 
+    SELECT
         id,
         name,
         ds
@@ -9566,7 +9664,7 @@ test_test_model:
                 cron '@daily'
             );
 
-            SELECT 
+            SELECT
                 id,
                 new_column,
                 ds

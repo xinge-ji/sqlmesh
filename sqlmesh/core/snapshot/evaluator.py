@@ -37,7 +37,6 @@ from sqlmesh.core import constants as c
 from sqlmesh.core import dialect as d
 from sqlmesh.core.audit import Audit, StandaloneAudit
 from sqlmesh.core.dialect import schema_
-from sqlmesh.core.engine_adapter import EngineAdapter
 from sqlmesh.core.engine_adapter.shared import InsertOverwriteStrategy, DataObjectType
 from sqlmesh.core.macros import RuntimeStage
 from sqlmesh.core.model import (
@@ -62,9 +61,11 @@ from sqlmesh.core.snapshot import (
     Intervals,
     Snapshot,
     SnapshotId,
+    SnapshotIdBatch,
     SnapshotInfoLike,
     SnapshotTableCleanupTask,
 )
+from sqlmesh.core.snapshot.execution_tracker import QueryExecutionTracker
 from sqlmesh.utils import random_id, CorrelationId
 from sqlmesh.utils.concurrency import (
     concurrent_apply_to_snapshots,
@@ -88,6 +89,7 @@ else:
 
 if t.TYPE_CHECKING:
     from sqlmesh.core.engine_adapter._typing import DF, QueryOrDF
+    from sqlmesh.core.engine_adapter.base import EngineAdapter
     from sqlmesh.core.environment import EnvironmentNamingInfo
 
 logger = logging.getLogger(__name__)
@@ -128,6 +130,11 @@ class SnapshotEvaluator:
         self.adapters = (
             adapters if isinstance(adapters, t.Dict) else {selected_gateway or "": adapters}
         )
+        self.execution_tracker = QueryExecutionTracker()
+        self.adapters = {
+            gateway: adapter.with_settings(query_execution_tracker=self.execution_tracker)
+            for gateway, adapter in self.adapters.items()
+        }
         self.adapter = (
             next(iter(self.adapters.values()))
             if not selected_gateway
@@ -169,19 +176,22 @@ class SnapshotEvaluator:
         Returns:
             The WAP ID of this evaluation if supported, None otherwise.
         """
-        result = self._evaluate_snapshot(
-            start=start,
-            end=end,
-            execution_time=execution_time,
-            snapshot=snapshot,
-            snapshots=snapshots,
-            allow_destructive_snapshots=allow_destructive_snapshots or set(),
-            allow_additive_snapshots=allow_additive_snapshots or set(),
-            deployability_index=deployability_index,
-            batch_index=batch_index,
-            target_table_exists=target_table_exists,
-            **kwargs,
-        )
+        with self.execution_tracker.track_execution(
+            SnapshotIdBatch(snapshot_id=snapshot.snapshot_id, batch_id=batch_index)
+        ):
+            result = self._evaluate_snapshot(
+                start=start,
+                end=end,
+                execution_time=execution_time,
+                snapshot=snapshot,
+                snapshots=snapshots,
+                allow_destructive_snapshots=allow_destructive_snapshots or set(),
+                allow_additive_snapshots=allow_additive_snapshots or set(),
+                deployability_index=deployability_index,
+                batch_index=batch_index,
+                target_table_exists=target_table_exists,
+                **kwargs,
+            )
         if result is None or isinstance(result, str):
             return result
         raise SQLMeshError(
@@ -641,7 +651,7 @@ class SnapshotEvaluator:
                 snapshot.snapshot_id,
                 wap_id,
             )
-            self._wap_publish_snapshot(snapshot, wap_id, deployability_index)
+            self.wap_publish_snapshot(snapshot, wap_id, deployability_index)
 
         return results
 
@@ -773,7 +783,8 @@ class SnapshotEvaluator:
                         allow_destructive_snapshots=allow_destructive_snapshots,
                         allow_additive_snapshots=allow_additive_snapshots,
                     )
-                    common_render_kwargs["runtime_stage"] = RuntimeStage.EVALUATING
+                    runtime_stage = RuntimeStage.EVALUATING
+                    target_table_exists = True
                 elif model.annotated or model.is_seed or model.kind.is_scd_type_2:
                     self._execute_create(
                         snapshot=snapshot,
@@ -785,11 +796,20 @@ class SnapshotEvaluator:
                         dry_run=False,
                         run_pre_post_statements=False,
                     )
-                    common_render_kwargs["runtime_stage"] = RuntimeStage.EVALUATING
+                    runtime_stage = RuntimeStage.EVALUATING
+                    target_table_exists = True
+
+            evaluate_render_kwargs = {
+                **common_render_kwargs,
+                "runtime_stage": runtime_stage,
+                "snapshot_table_exists": target_table_exists,
+            }
 
             wap_id: t.Optional[str] = None
-            if snapshot.is_materialized and (
-                model.wap_supported or adapter.wap_supported(target_table_name)
+            if (
+                snapshot.is_materialized
+                and target_table_exists
+                and (model.wap_supported or adapter.wap_supported(target_table_name))
             ):
                 wap_id = random_id()[0:8]
                 logger.info("Using WAP ID '%s' for snapshot %s", wap_id, snapshot.snapshot_id)
@@ -801,10 +821,11 @@ class SnapshotEvaluator:
                 execution_time=execution_time,
                 snapshot=snapshot,
                 snapshots=snapshots,
-                render_kwargs=common_render_kwargs,
+                render_kwargs=evaluate_render_kwargs,
                 create_render_kwargs=create_render_kwargs,
                 rendered_physical_properties=rendered_physical_properties,
                 deployability_index=deployability_index,
+                target_table_name=target_table_name,
                 is_first_insert=is_first_insert,
                 batch_index=batch_index,
             )
@@ -878,6 +899,17 @@ class SnapshotEvaluator:
         if on_complete is not None:
             on_complete(snapshot)
 
+    def wap_publish_snapshot(
+        self,
+        snapshot: Snapshot,
+        wap_id: str,
+        deployability_index: t.Optional[DeployabilityIndex],
+    ) -> None:
+        deployability_index = deployability_index or DeployabilityIndex.all_deployable()
+        table_name = snapshot.table_name(is_deployable=deployability_index.is_deployable(snapshot))
+        adapter = self.get_adapter(snapshot.model_gateway)
+        adapter.wap_publish(table_name, wap_id)
+
     def _render_and_insert_snapshot(
         self,
         start: TimeLike,
@@ -889,6 +921,7 @@ class SnapshotEvaluator:
         create_render_kwargs: t.Dict[str, t.Any],
         rendered_physical_properties: t.Dict[str, exp.Expression],
         deployability_index: DeployabilityIndex,
+        target_table_name: str,
         is_first_insert: bool,
         batch_index: int,
     ) -> None:
@@ -898,7 +931,6 @@ class SnapshotEvaluator:
         logger.info("Inserting data for snapshot %s", snapshot.snapshot_id)
 
         model = snapshot.model
-        table_name = snapshot.table_name(is_deployable=deployability_index.is_deployable(snapshot))
         adapter = self.get_adapter(model.gateway)
         evaluation_strategy = _evaluation_strategy(snapshot, adapter)
 
@@ -912,7 +944,7 @@ class SnapshotEvaluator:
         def apply(query_or_df: QueryOrDF, index: int = 0) -> None:
             if index > 0:
                 evaluation_strategy.append(
-                    table_name=table_name,
+                    table_name=target_table_name,
                     query_or_df=query_or_df,
                     model=snapshot.model,
                     snapshot=snapshot,
@@ -930,10 +962,10 @@ class SnapshotEvaluator:
                     "Inserting batch (%s, %s) into %s'",
                     time_like_to_str(start),
                     time_like_to_str(end),
-                    table_name,
+                    target_table_name,
                 )
                 evaluation_strategy.insert(
-                    table_name=table_name,
+                    table_name=target_table_name,
                     query_or_df=query_or_df,
                     is_first_insert=is_first_insert,
                     model=snapshot.model,
@@ -1259,17 +1291,6 @@ class SnapshotEvaluator:
 
             if on_complete is not None:
                 on_complete(table_name)
-
-    def _wap_publish_snapshot(
-        self,
-        snapshot: Snapshot,
-        wap_id: str,
-        deployability_index: t.Optional[DeployabilityIndex],
-    ) -> None:
-        deployability_index = deployability_index or DeployabilityIndex.all_deployable()
-        table_name = snapshot.table_name(is_deployable=deployability_index.is_deployable(snapshot))
-        adapter = self.get_adapter(snapshot.model_gateway)
-        adapter.wap_publish(table_name, wap_id)
 
     def _audit(
         self,
@@ -2293,13 +2314,19 @@ class ViewStrategy(PromotableStrategy):
         render_kwargs: t.Dict[str, t.Any],
         **kwargs: t.Any,
     ) -> None:
-        snapshot = kwargs["snapshot"]
+        # We should recreate MVs across supported engines (Snowflake, BigQuery etc) because
+        # if upstream tables were recreated (e.g FULL models), the MVs would be silently invalidated.
+        # The only exception to that rule is RisingWave which doesn't support CREATE OR REPLACE, so upstream
+        # models don't recreate their physical tables for the MVs to be invalidated.
+        # However, even for RW we still want to recreate MVs to avoid stale references, as is the case with normal views.
+        # The flag is_first_insert is used for that matter as a signal to recreate the MV if the snapshot's intervals
+        # have been cleared by `should_force_rebuild`
+        is_materialized_view = self._is_materialized_view(model)
+        must_recreate_view = not self.adapter.HAS_VIEW_BINDING or (
+            is_materialized_view and is_first_insert
+        )
 
-        if (
-            not snapshot.is_materialized_view
-            and self.adapter.HAS_VIEW_BINDING
-            and self.adapter.table_exists(table_name)
-        ):
+        if self.adapter.table_exists(table_name) and not must_recreate_view:
             logger.info("Skipping creation of the view '%s'", table_name)
             return
 
@@ -2308,8 +2335,8 @@ class ViewStrategy(PromotableStrategy):
             table_name,
             query_or_df,
             model.columns_to_types,
-            replace=not self.adapter.HAS_VIEW_BINDING,
-            materialized=self._is_materialized_view(model),
+            replace=must_recreate_view,
+            materialized=is_materialized_view,
             view_properties=kwargs.get("physical_properties", model.physical_properties),
             table_description=model.description,
             column_descriptions=model.column_descriptions,
@@ -2389,14 +2416,19 @@ class ViewStrategy(PromotableStrategy):
     def delete(self, name: str, **kwargs: t.Any) -> None:
         cascade = kwargs.pop("cascade", False)
         try:
-            self.adapter.drop_view(name, cascade=cascade)
+            # Some engines (e.g., RisingWave) don’t fail when dropping a materialized view with a DROP VIEW statement,
+            # because views and materialized views don’t share the same namespace. Therefore, we should not ignore if the
+            # view doesn't exist and let the exception handler attempt to drop the materialized view.
+            self.adapter.drop_view(name, cascade=cascade, ignore_if_not_exists=False)
         except Exception:
             logger.debug(
                 "Failed to drop view '%s'. Trying to drop the materialized view instead",
                 name,
                 exc_info=True,
             )
-            self.adapter.drop_view(name, materialized=True, cascade=cascade)
+            self.adapter.drop_view(
+                name, materialized=True, cascade=cascade, ignore_if_not_exists=True
+            )
         logger.info("Dropped view '%s'", name)
 
     def _is_materialized_view(self, model: Model) -> bool:

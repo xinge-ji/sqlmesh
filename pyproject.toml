@@ -12,6 +12,7 @@ dependencies = [
     "croniter",
     "duckdb>=0.10.0,!=0.10.3",
     "dateparser<=1.2.1",
+    "humanize",
     "hyperscript>=0.1.0",
     "importlib-metadata; python_version<'3.12'",
     "ipywidgets",
@@ -23,7 +24,7 @@ dependencies = [
     "requests",
     "rich[jupyter]",
     "ruamel.yaml",
-    "sqlglot[rs]~=27.8.0",
+    "sqlglot[rs]~=27.9.0",
     "tenacity",
     "time-machine",
     "json-stream"
@@ -52,7 +53,7 @@ bigframes = ["bigframes>=1.32.0"]
 clickhouse = ["clickhouse-connect"]
 databricks = ["databricks-sql-connector[pyarrow]"]
 dev = [
-    "agate==1.7.1",
+    "agate",
     "beautifulsoup4",
     "clickhouse-connect",
     "cryptography",
@@ -260,6 +261,7 @@ markers = [
     "mssql: test for MSSQL",
     "mysql: test for MySQL",
     "postgres: test for Postgres",
+    "gcp_postgres: test for Postgres on GCP",
     "redshift: test for Redshift",
     "snowflake: test for Snowflake",
     "spark: test for Spark",

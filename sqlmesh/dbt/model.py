@@ -154,7 +154,11 @@ class ModelConfig(BaseModelConfig):
 
     @field_validator("partition_by", mode="before")
     @classmethod
-    def _validate_partition_by(cls, v: t.Any) -> t.Union[t.List[str], t.Dict[str, t.Any]]:
+    def _validate_partition_by(
+        cls, v: t.Any
+    ) -> t.Optional[t.Union[t.List[str], t.Dict[str, t.Any]]]:
+        if v is None:
+            return None
         if isinstance(v, str):
             return [v]
         if isinstance(v, list):
@@ -586,7 +590,6 @@ class ModelConfig(BaseModelConfig):
             kind=kind,
             start=self.start or context.sqlmesh_config.model_defaults.start,
             audit_definitions=audit_definitions,
-            path=model_kwargs.pop("path", self.path),
             # This ensures that we bypass query rendering that would otherwise be required to extract additional
             # dependencies from the model's SQL.
             # Note: any table dependencies that are not referenced using the `ref` macro will not be included.

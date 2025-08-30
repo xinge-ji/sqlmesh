@@ -12,7 +12,7 @@ from sqlmesh.dbt.common import Dependencies
 from sqlmesh.dbt.manifest import ManifestHelper
 from sqlmesh.dbt.target import TargetConfig
 from sqlmesh.utils import AttributeDict
-from sqlmesh.utils.errors import ConfigError, SQLMeshError, MissingModelError
+from sqlmesh.utils.errors import ConfigError, SQLMeshError, MissingModelError, MissingSourceError
 from sqlmesh.utils.jinja import (
     JinjaGlobalAttribute,
     JinjaMacroRegistry,
@@ -101,7 +101,10 @@ class DbtContext:
         self._jinja_environment = None
 
     def set_and_render_variables(self, variables: t.Dict[str, t.Any], package: str) -> None:
-        jinja_environment = self.jinja_macros.build_environment(**self.jinja_globals)
+        package_macros = self.jinja_macros.copy(
+            update={"top_level_packages": [*self.jinja_macros.top_level_packages, package]}
+        )
+        jinja_environment = package_macros.build_environment(**self.jinja_globals)
 
         def _render_var(value: t.Any) -> t.Any:
             if isinstance(value, str):
@@ -263,14 +266,13 @@ class DbtContext:
                 else:
                     models[ref] = t.cast(ModelConfig, model)
             else:
-                exception = MissingModelError(ref)
-                raise exception
+                raise MissingModelError(ref)
 
         for source in dependencies.sources:
             if source in self.sources:
                 sources[source] = self.sources[source]
             else:
-                raise ConfigError(f"Source '{source}' was not found.")
+                raise MissingSourceError(source)
 
         variables = {k: v for k, v in self.variables.items() if k in dependencies.variables}
 

@@ -1,13 +1,57 @@
 .PHONY: docs
 
+ifdef UV
+    PIP := uv pip
+else
+    PIP := pip3
+endif
+
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+    SED_INPLACE = sed -i ''
+else
+    SED_INPLACE = sed -i
+endif
+
 install-dev:
-	pip3 install -e ".[dev,web,slack,dlt,lsp]" ./examples/custom_materializations
+	$(PIP) install -e ".[dev,web,slack,dlt,lsp]" ./examples/custom_materializations
 
 install-doc:
-	pip3 install -r ./docs/requirements.txt
+	$(PIP) install -r ./docs/requirements.txt
 
 install-pre-commit:
 	pre-commit install
+
+install-dev-dbt-%:
+	@version="$*"; \
+	period_count=$$(echo "$$version" | tr -cd '.' | wc -c); \
+	if [ "$$period_count" -eq 0 ]; then \
+		version="$${version:0:1}.$${version:1}"; \
+	elif [ "$$period_count" -eq 1 ]; then \
+		version="$$version.0"; \
+	fi; \
+	echo "Installing dbt version: $$version"; \
+	cp pyproject.toml pyproject.toml.backup; \
+	$(SED_INPLACE) 's/"pydantic>=2.0.0"/"pydantic"/g' pyproject.toml; \
+	if [ "$$version" = "1.10.0" ]; then \
+		echo "Applying special handling for dbt 1.10.0"; \
+		$(SED_INPLACE) -E 's/"(dbt-core)[^"]*"/"\1~='"$$version"'"/g' pyproject.toml; \
+		$(SED_INPLACE) -E 's/"(dbt-(bigquery|duckdb|snowflake|athena-community|clickhouse|databricks|redshift|trino))[^"]*"/"\1"/g' pyproject.toml; \
+	else \
+		echo "Applying version $$version to all dbt packages"; \
+		$(SED_INPLACE) -E 's/"(dbt-[^"><=~!]+)[^"]*"/"\1~='"$$version"'"/g' pyproject.toml; \
+	fi; \
+	$(MAKE) install-dev; \
+	if [ "$$version" = "1.6.0" ]; then \
+		echo "Applying overrides for dbt 1.6.0"; \
+		$(PIP) install 'pydantic>=2.0.0' 'google-cloud-bigquery==3.30.0' 'databricks-sdk==0.28.0' --reinstall; \
+	fi; \
+	if [ "$$version" = "1.7.0" ]; then \
+		echo "Applying overrides for dbt 1.7.0"; \
+		$(PIP) install 'databricks-sdk==0.28.0' --reinstall; \
+	fi; \
+	mv pyproject.toml.backup pyproject.toml; \
+	echo "Restored original pyproject.toml"
 
 style:
 	pre-commit run --all-files
@@ -22,16 +66,16 @@ doc-test:
 	python -m pytest --doctest-modules sqlmesh/core sqlmesh/utils
 
 package:
-	pip3 install build && python3 -m build
+	$(PIP) install build && python3 -m build
 
 publish: package
-	pip3 install twine && python3 -m twine upload dist/*
+	$(PIP) install twine && python3 -m twine upload dist/*
 
 package-tests:
-	pip3 install build && cp pyproject.toml tests/sqlmesh_pyproject.toml && python3 -m build tests/
+	$(PIP) install build && cp pyproject.toml tests/sqlmesh_pyproject.toml && python3 -m build tests/
 
 publish-tests: package-tests
-	pip3 install twine && python3 -m twine upload -r tobiko-private tests/dist/*
+	$(PIP) install twine && python3 -m twine upload -r tobiko-private tests/dist/*
 
 docs-serve:
 	mkdocs serve
@@ -93,6 +137,9 @@ engine-test:
 dbt-test:
 	pytest -n auto -m "dbt and not cicdonly"
 
+dbt-fast-test:
+	pytest -n auto -m "dbt and fast" --retries 3
+
 github-test:
 	pytest -n auto -m "github"
 
@@ -109,7 +156,7 @@ guard-%:
 	fi
 
 engine-%-install:
-	pip3 install -e ".[dev,web,slack,lsp,${*}]" ./examples/custom_materializations
+	$(PIP) install -e ".[dev,web,slack,lsp,${*}]" ./examples/custom_materializations
 
 engine-docker-%-up:
 	docker compose -f ./tests/core/engine_adapter/integration/docker/compose.${*}.yaml up -d
@@ -159,11 +206,11 @@ snowflake-test: guard-SNOWFLAKE_ACCOUNT guard-SNOWFLAKE_WAREHOUSE guard-SNOWFLAK
 	pytest -n auto -m "snowflake" --retries 3 --junitxml=test-results/junit-snowflake.xml
 
 bigquery-test: guard-BIGQUERY_KEYFILE engine-bigquery-install
-	pip install -e ".[bigframes]"
+	$(PIP) install -e ".[bigframes]"
 	pytest -n auto -m "bigquery" --retries 3 --junitxml=test-results/junit-bigquery.xml
 
 databricks-test: guard-DATABRICKS_CATALOG guard-DATABRICKS_SERVER_HOSTNAME guard-DATABRICKS_HTTP_PATH guard-DATABRICKS_ACCESS_TOKEN guard-DATABRICKS_CONNECT_VERSION engine-databricks-install
-	pip install 'databricks-connect==${DATABRICKS_CONNECT_VERSION}'
+	$(PIP) install 'databricks-connect==${DATABRICKS_CONNECT_VERSION}'
 	pytest -n auto -m "databricks" --retries 3 --junitxml=test-results/junit-databricks.xml
 
 redshift-test: guard-REDSHIFT_HOST guard-REDSHIFT_USER guard-REDSHIFT_PASSWORD guard-REDSHIFT_DATABASE engine-redshift-install
@@ -176,7 +223,7 @@ athena-test: guard-AWS_ACCESS_KEY_ID guard-AWS_SECRET_ACCESS_KEY guard-ATHENA_S3
 	pytest -n auto -m "athena" --retries 3 --junitxml=test-results/junit-athena.xml
 
 fabric-test: guard-FABRIC_HOST guard-FABRIC_CLIENT_ID guard-FABRIC_CLIENT_SECRET guard-FABRIC_DATABASE engine-fabric-install
-	pytest -n auto -m "fabric" --retries 3 --junitxml=test-results/junit-fabric.xml	
+	pytest -n auto -m "fabric" --retries 3 --junitxml=test-results/junit-fabric.xml
 
 gcp-postgres-test: guard-GCP_POSTGRES_INSTANCE_CONNECTION_STRING guard-GCP_POSTGRES_USER guard-GCP_POSTGRES_PASSWORD guard-GCP_POSTGRES_KEYFILE_JSON engine-gcppostgres-install
 	pytest -n auto -m "gcp_postgres" --retries 3 --junitxml=test-results/junit-gcp-postgres.xml

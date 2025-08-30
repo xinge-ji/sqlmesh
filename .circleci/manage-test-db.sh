@@ -51,7 +51,7 @@ databricks_init() {
 
     # Note: the cluster doesnt need to be running to create / drop catalogs, but it does need to be running to run the integration tests
     echo "Ensuring cluster is running"
-    databricks clusters start $CLUSTER_ID || true
+    databricks clusters start $CLUSTER_ID
 }
 
 databricks_up() {
@@ -80,7 +80,11 @@ redshift_down() {
     EXIT_CODE=1
     ATTEMPTS=0
     while [ $EXIT_CODE -ne 0 ] && [ $ATTEMPTS -lt 5 ]; do
-        redshift_exec "select pg_terminate_backend(procpid) from pg_stat_activity where datname = '$1'"
+        # note: sometimes this pg_terminate_backend() call can randomly fail with: ERROR:  Insufficient privileges 
+        # if it does, let's proceed with the drop anyway rather than aborting and never attempting the drop
+        redshift_exec "select pg_terminate_backend(procpid) from pg_stat_activity where datname = '$1'" || true
+        
+        # perform drop
         redshift_exec "drop database $1;" && EXIT_CODE=$? || EXIT_CODE=$?
         if [ $EXIT_CODE -ne 0 ]; then
             echo "Unable to drop database; retrying..."
