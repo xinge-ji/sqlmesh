@@ -22,6 +22,7 @@ from sqlmesh.core import constants as c
 from sqlmesh.core import dialect as d
 from sqlmesh.core.console import get_console
 from sqlmesh.core.audit import ModelAudit, load_audit
+from sqlmesh.core.model.common import ParsableSql
 from sqlmesh.core.config import (
     Config,
     DuckDBConnectionConfig,
@@ -5732,7 +5733,7 @@ def test_default_catalog_sql(assert_exp_eq):
     The system is not designed to actually support having an engine that doesn't support default catalog
     to start supporting it or the reverse of that. If that did happen then bugs would occur.
     """
-    HASH_WITH_CATALOG = "1269513823"
+    HASH_WITH_CATALOG = "2768215345"
 
     # Test setting default catalog doesn't change hash if it matches existing logic
     expressions = d.parse(
@@ -7685,6 +7686,75 @@ lookback 3
     )
 
 
+def test_custom_kind_lookback_property():
+    """Test that CustomKind's lookback property is correctly accessed via ModelMeta.lookback.
+
+    This test verifies the fix for issue #5268 where CustomKind models were not respecting
+    the lookback parameter because the isinstance check for _IncrementalBy failed.
+    """
+
+    # Test 1: CustomKind with lookback = 3
+    class MyTestStrategy(CustomMaterialization):
+        pass
+
+    expressions = d.parse(
+        """
+        MODEL (
+            name db.custom_table,
+            kind CUSTOM (
+                materialization 'MyTestStrategy',
+                lookback 3
+            )
+        );
+        SELECT a, b FROM upstream
+        """
+    )
+
+    model = load_sql_based_model(expressions)
+    assert model.kind.is_custom
+
+    # Verify that the kind itself has lookback = 3
+    kind = t.cast(CustomKind, model.kind)
+    assert kind.lookback == 3
+
+    # The bug: model.lookback should return 3, but with the old implementation
+    # using isinstance(self.kind, _IncrementalBy), it would return 0
+    assert model.lookback == 3, "CustomKind lookback not accessible via model.lookback property"
+
+    # Test 2: CustomKind without lookback (should default to 0)
+    expressions_no_lookback = d.parse(
+        """
+        MODEL (
+            name db.custom_table_no_lookback,
+            kind CUSTOM (
+                materialization 'MyTestStrategy'
+            )
+        );
+        SELECT a, b FROM upstream
+        """
+    )
+
+    model_no_lookback = load_sql_based_model(expressions_no_lookback)
+    assert model_no_lookback.lookback == 0
+
+    # Test 3: Ensure IncrementalByTimeRangeKind still works correctly
+    incremental_expressions = d.parse(
+        """
+        MODEL (
+            name db.incremental_table,
+            kind INCREMENTAL_BY_TIME_RANGE (
+                time_column ds,
+                lookback 5
+            )
+        );
+        SELECT ds, a, b FROM upstream
+        """
+    )
+
+    incremental_model = load_sql_based_model(incremental_expressions)
+    assert incremental_model.lookback == 5
+
+
 def test_time_column_format_in_custom_kind():
     class TimeColumnCustomKind(CustomKind):  # type: ignore[no-untyped-def]
         _time_column: TimeColumn
@@ -8308,15 +8378,9 @@ def test_macro_func_hash(mocker: MockerFixture, metadata_only: bool):
     new_model = load_sql_based_model(
         expressions, path=Path("./examples/sushi/models/test_model.sql")
     )
-    if metadata_only:
-        assert "noop" not in new_model._data_hash_values[0]
-        assert "noop" in new_model._additional_metadata[0]
-        assert model.data_hash == new_model.data_hash
-        assert model.metadata_hash != new_model.metadata_hash
-    else:
-        assert "noop" in new_model._data_hash_values[0]
-        assert model.data_hash != new_model.data_hash
-        assert model.metadata_hash == new_model.metadata_hash
+    assert model.metadata_hash != new_model.metadata_hash
+    assert model.data_hash != new_model.data_hash
+    assert new_model.is_metadata_only_change(model) == metadata_only
 
     @macro(metadata_only=metadata_only)  # type: ignore
     def noop(evaluator) -> None:
@@ -8336,6 +8400,7 @@ def test_macro_func_hash(mocker: MockerFixture, metadata_only: bool):
         assert "print" in updated_model._data_hash_values[0]
         assert new_model.data_hash != updated_model.data_hash
         assert new_model.metadata_hash == updated_model.metadata_hash
+    assert updated_model.is_metadata_only_change(new_model) == metadata_only
 
 
 def test_managed_kind_sql():
@@ -8874,7 +8939,9 @@ def test_column_description_metadata_change():
     context.upsert_model(model)
     context.plan(no_prompts=True, auto_apply=True)
 
-    context.upsert_model("db.test_model", query=parse_one("SELECT 1 AS id /* description 2 */"))
+    context.upsert_model(
+        "db.test_model", query_=ParsableSql(sql="SELECT 1 AS id /* description 2 */")
+    )
     plan = context.plan(no_prompts=True, auto_apply=True)
 
     snapshots = list(plan.snapshots.values())
@@ -10729,7 +10796,7 @@ def f():
         Context(paths=tmp_path, config=config)
 
 
-def test_semicolon_is_not_included_in_model_state(tmp_path, assert_exp_eq):
+def test_semicolon_is_metadata_only_change(tmp_path, assert_exp_eq):
     init_example_project(tmp_path, engine_type="duckdb", template=ProjectTemplate.EMPTY)
 
     db_connection = DuckDBConnectionConfig(database=str(tmp_path / "db.db"))
@@ -10818,7 +10885,9 @@ SELECT
     ctx.load()
     plan = ctx.plan(no_prompts=True, auto_apply=True)
 
-    assert not plan.context_diff.modified_snapshots
+    assert len(plan.context_diff.modified_snapshots) == 1
+    assert len(plan.new_snapshots) == 1
+    assert plan.new_snapshots[0].is_metadata
 
 
 def test_invalid_audit_reference():
@@ -11471,3 +11540,46 @@ def test_raw_jinja_raw_tag():
 
     model = load_sql_based_model(expressions)
     assert model.render_query().sql() == "SELECT '{{ foo }}' AS \"col\""
+
+
+def test_use_original_sql():
+    expressions = d.parse(
+        """
+        MODEL (name test);
+
+        CREATE TABLE pre (
+          a INT
+        );
+
+        SELECT
+          1,
+          2;
+
+        CREATE TABLE post (
+          b INT
+        );
+        """
+    )
+
+    model = load_sql_based_model(expressions)
+    assert model.query_.sql == "SELECT\n          1,\n          2"
+    assert model.pre_statements_[0].sql == "CREATE TABLE pre (\n          a INT\n        )"
+    assert model.post_statements_[0].sql == "CREATE TABLE post (\n          b INT\n        );"
+
+    # Now manually create the model and make sure that the original SQL is not used
+    model_query = d.parse_one("SELECT 1 AS one")
+    assert model_query.meta["sql"] == "SELECT 1 AS one"
+    model_query = model_query.select("2 AS two")
+
+    pre_statements = [d.parse_one("CREATE TABLE pre (\n          a INT\n        )")]
+    post_statements = [d.parse_one("CREATE TABLE post (\n          b INT\n        );")]
+
+    model = create_sql_model(
+        "test",
+        model_query,
+        pre_statements=pre_statements,
+        post_statements=post_statements,
+    )
+    assert model.query_.sql == "SELECT 1 AS one, 2 AS two"
+    assert model.pre_statements_[0].sql == "CREATE TABLE pre (a INT)"
+    assert model.post_statements_[0].sql == "CREATE TABLE post (b INT)"

@@ -2309,7 +2309,6 @@ class DorisConnectionConfig(ConnectionConfig):
     charset: t.Optional[str] = None
     collation: t.Optional[str] = None
     ssl_disabled: t.Optional[bool] = None
-
     concurrent_tasks: int = 4
     register_comments: bool = True
     local_infile: bool = False

@@ -79,7 +79,7 @@ def parent_model():
         name="parent.tbl",
         kind=dict(time_column="ds", name=ModelKindName.INCREMENTAL_BY_TIME_RANGE),
         dialect="spark",
-        query=parse_one("SELECT 1, ds"),
+        query="SELECT 1, ds",
     )
 
 
@@ -92,7 +92,7 @@ def model():
         dialect="spark",
         cron="1 0 * * *",
         start="2020-01-01",
-        query=parse_one("SELECT @EACH([1, 2], x -> x), ds FROM parent.tbl"),
+        query="SELECT @EACH([1, 2], x -> x), ds FROM parent.tbl",
     )
 
 
@@ -148,7 +148,9 @@ def test_json(snapshot: Snapshot):
             "project": "",
             "python_env": {},
             "owner": "owner",
-            "query": "SELECT @EACH([1, 2], x -> x), ds FROM parent.tbl",
+            "query": {
+                "sql": "SELECT @EACH([1, 2], x -> x), ds FROM parent.tbl",
+            },
             "jinja_macros": {
                 "create_builtins_module": "sqlmesh.utils.jinja",
                 "global_objs": {},
@@ -186,7 +188,7 @@ def test_json_custom_materialization(make_snapshot: t.Callable):
         dialect="spark",
         cron="1 0 * * *",
         start="2020-01-01",
-        query=parse_one("SELECT @EACH([1, 2], x -> x), ds FROM parent.tbl"),
+        query="SELECT @EACH([1, 2], x -> x), ds FROM parent.tbl",
     )
 
     snapshot = make_snapshot(
@@ -679,6 +681,43 @@ def test_lookback(make_snapshot):
     assert snapshot.missing_intervals("2023-01-28", "2023-01-30", "2023-01-31 04:00:00") == []
 
 
+def test_lookback_custom_materialization(make_snapshot):
+    from sqlmesh import CustomMaterialization
+
+    class MyTestStrategy(CustomMaterialization):
+        pass
+
+    expressions = parse(
+        """
+        MODEL (
+            name name,
+            kind CUSTOM (
+                materialization 'MyTestStrategy',
+                lookback 2
+            ),
+            start '2023-01-01',
+            cron '0 5 * * *',
+        );
+
+        SELECT ds FROM parent.tbl
+        """
+    )
+
+    snapshot = make_snapshot(load_sql_based_model(expressions))
+
+    assert snapshot.missing_intervals("2023-01-01", "2023-01-01") == [
+        (to_timestamp("2023-01-01"), to_timestamp("2023-01-02")),
+    ]
+
+    snapshot.add_interval("2023-01-01", "2023-01-04")
+    assert snapshot.missing_intervals("2023-01-01", "2023-01-04") == []
+    assert snapshot.missing_intervals("2023-01-01", "2023-01-05") == [
+        (to_timestamp("2023-01-03"), to_timestamp("2023-01-04")),
+        (to_timestamp("2023-01-04"), to_timestamp("2023-01-05")),
+        (to_timestamp("2023-01-05"), to_timestamp("2023-01-06")),
+    ]
+
+
 def test_seed_intervals(make_snapshot):
     snapshot_a = make_snapshot(
         SeedModel(
@@ -913,8 +952,8 @@ def test_fingerprint(model: Model, parent_model: Model):
     fingerprint = fingerprint_from_node(model, nodes={})
 
     original_fingerprint = SnapshotFingerprint(
-        data_hash="3301649319",
-        metadata_hash="3575333731",
+        data_hash="2406542604",
+        metadata_hash="3341445192",
     )
 
     assert fingerprint == original_fingerprint
@@ -941,7 +980,7 @@ def test_fingerprint(model: Model, parent_model: Model):
     model = SqlModel(**{**model.dict(), "query": parse_one("select 1, ds -- annotation")})
     fingerprint = fingerprint_from_node(model, nodes={})
     assert new_fingerprint != fingerprint
-    assert new_fingerprint.data_hash == fingerprint.data_hash
+    assert new_fingerprint.data_hash != fingerprint.data_hash
     assert new_fingerprint.metadata_hash != fingerprint.metadata_hash
 
     model = SqlModel(
@@ -951,14 +990,14 @@ def test_fingerprint(model: Model, parent_model: Model):
     assert new_fingerprint != fingerprint
     assert new_fingerprint.data_hash != fingerprint.data_hash
     assert new_fingerprint.metadata_hash != fingerprint.metadata_hash
-    assert fingerprint.metadata_hash == original_fingerprint.metadata_hash
+    assert fingerprint.metadata_hash != original_fingerprint.metadata_hash
 
     model = SqlModel(**{**original_model.dict(), "post_statements": [parse_one("DROP TABLE test")]})
     fingerprint = fingerprint_from_node(model, nodes={})
     assert new_fingerprint != fingerprint
     assert new_fingerprint.data_hash != fingerprint.data_hash
     assert new_fingerprint.metadata_hash != fingerprint.metadata_hash
-    assert fingerprint.metadata_hash == original_fingerprint.metadata_hash
+    assert fingerprint.metadata_hash != original_fingerprint.metadata_hash
 
 
 def test_fingerprint_seed_model():
@@ -1013,8 +1052,8 @@ def test_fingerprint_jinja_macros(model: Model):
         }
     )
     original_fingerprint = SnapshotFingerprint(
-        data_hash="2908339239",
-        metadata_hash="3575333731",
+        data_hash="93332825",
+        metadata_hash="3341445192",
     )
 
     fingerprint = fingerprint_from_node(model, nodes={})

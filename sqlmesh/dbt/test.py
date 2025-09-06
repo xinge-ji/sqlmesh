@@ -12,7 +12,6 @@ from sqlmesh.dbt.common import (
     Dependencies,
     GeneralConfig,
     SqlStr,
-    extract_jinja_config,
     sql_str_validator,
 )
 from sqlmesh.utils import AttributeDict
@@ -60,6 +59,10 @@ class TestConfig(GeneralConfig):
         warn_if: Conditional expression (default "!=0") to detect if warn condition met (Not supported).
         error_if: Conditional expression (default "!=0") to detect if error condition met (Not supported).
     """
+
+    __test__ = (
+        False  # prevent pytest trying to collect this as a test class when it's imported in a test
+    )
 
     # SQLMesh fields
     path: Path = Path()
@@ -134,9 +137,7 @@ class TestConfig(GeneralConfig):
             }
         )
 
-        sql_no_config, _sql_config_only = extract_jinja_config(self.sql)
-        sql_no_config = sql_no_config.replace("**_dbt_generic_test_kwargs", self._kwargs())
-        query = d.jinja_query(sql_no_config)
+        query = d.jinja_query(self.sql.replace("**_dbt_generic_test_kwargs", self._kwargs()))
 
         skip = not self.enabled
         blocking = self.severity == Severity.ERROR

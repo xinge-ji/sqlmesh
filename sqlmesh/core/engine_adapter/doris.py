@@ -6,7 +6,7 @@ import re
 
 from sqlglot import exp, parse_one
 
-from sqlmesh.core.dialect import to_schema, transform_values
+from sqlmesh.core.dialect import to_schema
 
 from sqlmesh.core.engine_adapter.base import (
     InsertOverwriteStrategy,
@@ -23,15 +23,14 @@ from sqlmesh.core.engine_adapter.shared import (
     DataObjectType,
     set_catalog,
 )
-from sqlmesh.core.schema_diff import SchemaDiffer
-from sqlmesh.utils import random_id, get_source_columns_to_types
+from sqlmesh.utils import random_id
 from sqlmesh.utils.errors import (
     SQLMeshError,
 )
 
 if t.TYPE_CHECKING:
     from sqlmesh.core._typing import SchemaName, TableName
-    from sqlmesh.core.engine_adapter._typing import QueryOrDF, Query
+    from sqlmesh.core.engine_adapter._typing import QueryOrDF
     from sqlmesh.core.node import IntervalUnit
 
 logger = logging.getLogger(__name__)
@@ -46,7 +45,8 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
     COMMENT_CREATION_VIEW = CommentCreationView.IN_SCHEMA_DEF_NO_COMMANDS
     MAX_TABLE_COMMENT_LENGTH = 2048
     MAX_COLUMN_COMMENT_LENGTH = 255
-    SUPPORTS_REPLACE_TABLE = False 
+    SUPPORTS_INDEXES = True
+    SUPPORTS_REPLACE_TABLE = False
     MAX_IDENTIFIER_LENGTH = 64
     SUPPORTS_MATERIALIZED_VIEWS = True
     SUPPORTS_MATERIALIZED_VIEW_SCHEMA = True
@@ -262,7 +262,75 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
                     this=exp.Schema(expressions=part_by_list),
                 )
 
-            # Other properties (COMMENT, DISTRIBUTED BY, PROPERTIES) via builder; omit partitioned_by here
+            # BUILD / REFRESH / ON (refresh trigger) / KEY using AST properties
+            # We intentionally add these BEFORE comment/partition/distribution so the SQL order matches expectations
+            if view_properties:
+
+                def _to_unquoted_var(val: t.Any) -> exp.Expression:
+                    if isinstance(val, exp.Literal):
+                        return exp.Var(this=str(val.this))
+                    if isinstance(val, exp.Identifier):
+                        return exp.Var(this=str(val.this))
+                    if isinstance(val, exp.Expression):
+                        return val
+                    if isinstance(val, str):
+                        return exp.Var(this=val)
+                    return exp.Literal.string(str(val))
+
+                build = view_properties.get("build")
+                if build is not None:
+                    props.append(
+                        exp.Property(
+                            this=exp.Var(this="BUILD"),
+                            value=_to_unquoted_var(build),
+                        )
+                    )
+
+                refresh = view_properties.get("refresh")
+                if refresh is not None:
+                    props.append(
+                        exp.Property(
+                            this=exp.Var(this="REFRESH"),
+                            value=_to_unquoted_var(refresh),
+                        )
+                    )
+
+                refresh_trigger = view_properties.get("refresh_trigger")
+                if refresh_trigger is not None:
+                    # Accept values like "ON MANUAL" or "SCHEDULE ...". If the string starts with ON, drop it.
+                    trigger_val: t.Any = refresh_trigger
+                    if isinstance(trigger_val, str) and trigger_val.upper().startswith("ON "):
+                        trigger_val = trigger_val[3:].strip()
+                    elif (
+                        isinstance(trigger_val, exp.Literal)
+                        and isinstance(trigger_val.this, str)
+                        and str(trigger_val.this).upper().startswith("ON ")
+                    ):
+                        trigger_val = str(trigger_val.this)[3:].strip()
+                    props.append(
+                        exp.Property(
+                            this=exp.Var(this="ON"),
+                            value=_to_unquoted_var(trigger_val),
+                        )
+                    )
+
+                unique_key = view_properties.get("unique_key")
+                if unique_key is not None:
+                    key_columns: t.List[exp.Expression] = []
+                    if isinstance(unique_key, exp.Tuple):
+                        key_columns = list(unique_key.expressions)
+                    elif isinstance(unique_key, (exp.Column, exp.Identifier)):
+                        key_columns = [unique_key]
+                    elif isinstance(unique_key, exp.Literal):
+                        key_columns = [exp.to_column(unique_key.this)]
+                    elif isinstance(unique_key, str):
+                        key_columns = [exp.to_column(unique_key)]
+                    else:
+                        key_columns = [exp.to_column(str(unique_key))]
+
+                    props.append(exp.UniqueKeyProperty(expressions=key_columns))
+
+            # Other properties (COMMENT, DISTRIBUTED BY, generic PROPERTIES) via builder; omit partitioned_by here
             extra_props_node = self._build_table_properties_exp(
                 catalog_name=target_table.catalog,
                 table_properties=view_properties or None,
@@ -274,93 +342,207 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
                 ),
                 table_kind="MATERIALIZED_VIEW",
             )
-            if extra_props_node is not None and getattr(extra_props_node, "expressions", None):
-                # Ensure COMMENT comes before PARTITION BY, then other properties
-                comment_props = [p for p in extra_props_node.expressions if isinstance(p, exp.SchemaCommentProperty)]
-                non_comment_props = [
-                    p for p in extra_props_node.expressions if not isinstance(p, exp.SchemaCommentProperty)
-                ]
-                props.extend(comment_props)
-                if partition_prop is not None:
-                    props.append(partition_prop)
-                props.extend(non_comment_props)
-            elif partition_prop is not None:
-                props.append(partition_prop)
 
-            create_props = exp.Properties(expressions=props) if props else None
+            # Split extra props into categories for ordering
+            comment_prop: t.Optional[exp.SchemaCommentProperty] = None
+            distributed_props: t.List[exp.Expression] = []
+            generic_props: t.List[exp.Property] = []
+            if extra_props_node is not None and getattr(extra_props_node, "expressions", None):
+                for p in extra_props_node.expressions:
+                    if isinstance(p, exp.SchemaCommentProperty):
+                        comment_prop = p
+                    elif isinstance(p, exp.DistributedByProperty):
+                        distributed_props.append(p)
+                    elif isinstance(p, exp.Property):
+                        generic_props.append(p)
+
+            # Append in desired order: COMMENT -> PARTITION -> DISTRIBUTED -> GENERIC PROPERTIES
+            if comment_prop is not None:
+                props.append(comment_prop)
+            if partition_prop is not None:
+                props.append(partition_prop)
+            if distributed_props:
+                props.extend(distributed_props)
+            if generic_props:
+                props.extend(generic_props)
+
+            # Build ordered list of property expressions (SQLGlot AST), so generator renders them correctly
+            ordered_props: t.List[exp.Expression] = []
+            ordered_props.append(exp.MaterializedProperty())
+
+            # BUILD / REFRESH using Doris-native nodes: BuildProperty and RefreshTriggerProperty
+            if view_properties:
+
+                def _to_upper_str(val: t.Any) -> str:
+                    if isinstance(val, exp.Literal):
+                        return str(val.this).upper()
+                    if isinstance(val, exp.Identifier):
+                        return str(val.this).upper()
+                    if isinstance(val, str):
+                        return val.upper()
+                    if isinstance(val, exp.Expression):
+                        return val.sql(dialect=self.dialect).upper()
+                    return str(val).upper()
+
+                def _to_var_upper(val: t.Any) -> exp.Var:
+                    return exp.Var(this=_to_upper_str(val))
+
+                def _parse_refresh_tuple(
+                    tpl: exp.Tuple,
+                ) -> t.Tuple[
+                    exp.Var, t.Optional[str], t.Optional[exp.Literal], t.Optional[exp.Var], t.Optional[exp.Literal]
+                ]:
+                    method_var: exp.Var = exp.Var(this="AUTO")
+                    kind_str: t.Optional[str] = None
+                    every_lit: t.Optional[exp.Literal] = None
+                    unit_var: t.Optional[exp.Var] = None
+                    starts_lit: t.Optional[exp.Literal] = None
+                    for e in tpl.expressions:
+                        if (
+                            isinstance(e, exp.EQ)
+                            and isinstance(e.this, exp.Column)
+                            and isinstance(e.this.this, exp.Identifier)
+                        ):
+                            key = str(e.this.this.this).strip('"').lower()
+                            val = e.expression
+                            if key == "method":
+                                method_var = _to_var_upper(val)
+                            elif key == "kind":
+                                kind_str = _to_upper_str(val)
+                            elif key == "every":
+                                if isinstance(val, exp.Literal):
+                                    # Keep numeric literal as-is so generator renders it
+                                    every_lit = val
+                                elif isinstance(val, (int, float)):
+                                    every_lit = exp.Literal.number(int(val))
+                            elif key == "unit":
+                                unit_var = _to_var_upper(val)
+                            elif key == "starts":
+                                if isinstance(val, exp.Literal):
+                                    starts_lit = exp.Literal.string(str(val.this))
+                                else:
+                                    starts_lit = exp.Literal.string(str(val))
+                    return method_var, kind_str, every_lit, unit_var, starts_lit
+
+                def _parse_trigger_string(
+                    trigger_text: str,
+                ) -> t.Tuple[t.Optional[str], t.Optional[exp.Literal], t.Optional[exp.Var], t.Optional[exp.Literal]]:
+                    text = trigger_text.strip()
+                    if text.upper().startswith("ON "):
+                        text = text[3:].strip()
+                    kind = None
+                    every_lit: t.Optional[exp.Literal] = None
+                    unit_var = None
+                    starts_lit = None
+                    import re as _re
+
+                    m_kind = _re.match(r"^(MANUAL|COMMIT|SCHEDULE)\b", text, flags=_re.IGNORECASE)
+                    if m_kind:
+                        kind = m_kind.group(1).upper()
+                    m_every = _re.search(r"\bEVERY\s+(\d+)\s+(\w+)", text, flags=_re.IGNORECASE)
+                    if m_every:
+                        every_lit = exp.Literal.number(int(m_every.group(1)))
+                        unit_var = exp.Var(this=m_every.group(2).upper())
+                    m_starts = _re.search(r"\bSTARTS\s+'([^']+)'", text, flags=_re.IGNORECASE)
+                    if m_starts:
+                        starts_lit = exp.Literal.string(m_starts.group(1))
+                    return kind, every_lit, unit_var, starts_lit
+
+                # BUILD
+                build_val = view_properties.get("build")
+                if build_val is not None:
+                    ordered_props.append(exp.BuildProperty(this=_to_var_upper(build_val)))
+
+                # REFRESH + optional trigger combined into RefreshTriggerProperty
+                refresh_val = view_properties.get("refresh")
+                refresh_trigger_val = view_properties.get("refresh_trigger")
+                if refresh_val is not None or refresh_trigger_val is not None:
+                    method_var: exp.Var = _to_var_upper(refresh_val or "AUTO")
+                    kind_str: t.Optional[str] = None
+                    every_lit: t.Optional[exp.Literal] = None
+                    unit_var: t.Optional[exp.Var] = None
+                    starts_lit: t.Optional[exp.Literal] = None
+
+                    if isinstance(refresh_val, exp.Tuple):
+                        method_var, kind_str, every_lit, unit_var, starts_lit = _parse_refresh_tuple(refresh_val)
+                    else:
+                        if refresh_trigger_val is not None:
+                            trigger_text = (
+                                str(refresh_trigger_val.this)
+                                if isinstance(refresh_trigger_val, exp.Literal)
+                                else str(refresh_trigger_val)
+                            )
+                            k, e, u, s = _parse_trigger_string(trigger_text)
+                            kind_str, every_lit, unit_var, starts_lit = k, e, u, s
+
+                    ordered_props.append(
+                        exp.RefreshTriggerProperty(
+                            method=method_var,
+                            kind=kind_str,
+                            every=every_lit,
+                            unit=unit_var,
+                            starts=starts_lit,
+                        )
+                    )
+
+            # KEY (unique)
+            if view_properties and view_properties.get("unique_key") is not None:
+                unique_key = view_properties.get("unique_key")
+                key_columns: t.List[exp.Expression] = []
+                if isinstance(unique_key, exp.Tuple):
+                    key_columns = list(unique_key.expressions)
+                elif isinstance(unique_key, (exp.Column, exp.Identifier)):
+                    key_columns = [unique_key]
+                elif isinstance(unique_key, exp.Literal):
+                    key_columns = [exp.to_column(unique_key.this)]
+                elif isinstance(unique_key, str):
+                    key_columns = [exp.to_column(unique_key)]
+                else:
+                    key_columns = [exp.to_column(str(unique_key))]
+                ordered_props.append(exp.UniqueKeyProperty(expressions=key_columns))
+
+            # COMMENT
+            if table_description:
+                ordered_props.append(
+                    exp.SchemaCommentProperty(this=exp.Literal.string(self._truncate_table_comment(table_description)))
+                )
+
+            # PARTITION BY
+            if partition_prop is not None:
+                ordered_props.append(partition_prop)
+
+            # DISTRIBUTED BY
+            if view_properties and view_properties.get("distributed_by") is not None:
+                _tmp_props = self._build_table_properties_exp(
+                    catalog_name=target_table.catalog,
+                    table_properties={"distributed_by": view_properties.get("distributed_by")},
+                    table_kind="MATERIALIZED_VIEW",
+                )
+                if _tmp_props and getattr(_tmp_props, "expressions", None):
+                    for p in _tmp_props.expressions:
+                        if isinstance(p, exp.DistributedByProperty):
+                            ordered_props.append(p)
+                            break
+
+            # Generic PROPERTIES (e.g., replication_num)
+            if view_properties:
+                leftover: t.Dict[str, t.Any] = {}
+                for k, v in view_properties.items():
+                    if k in {"build", "refresh", "refresh_trigger", "distributed_by", "unique_key"}:
+                        continue
+                    leftover[k] = v
+                if leftover:
+                    ordered_props.extend(self._properties_to_expressions(leftover))
 
             create_exp = exp.Create(
                 this=schema,
                 kind="VIEW",
                 replace=False,
                 expression=query,
-                properties=create_props,
+                properties=exp.Properties(expressions=ordered_props),
             )
 
-            create_sql = create_exp.sql(dialect=self.dialect, identify=True)
-
-            # Insert BUILD / REFRESH / refresh_trigger immediately after the column list
-            doris_inline_clauses: t.List[str] = []
-            if view_properties:
-                build = view_properties.get("build")
-                if build is not None:
-                    build_value = build.this if isinstance(build, exp.Literal) else str(build)
-                    doris_inline_clauses.append(f"BUILD {build_value}")
-                refresh = view_properties.get("refresh")
-                if refresh is not None:
-                    refresh_value = refresh.this if isinstance(refresh, exp.Literal) else str(refresh)
-                    doris_inline_clauses.append(f"REFRESH {refresh_value}")
-                refresh_trigger = view_properties.get("refresh_trigger")
-                if refresh_trigger is not None:
-                    refresh_trigger_value = (
-                        refresh_trigger.this if isinstance(refresh_trigger, exp.Literal) else str(refresh_trigger)
-                    )
-                    doris_inline_clauses.append(str(refresh_trigger_value))
-                # Doris materialized views use KEY (<cols>) instead of UNIQUE KEY property
-                unique_key = view_properties.get("unique_key")
-                if unique_key is not None:
-                    # Normalize to a list of column expressions
-                    key_columns: t.List[exp.Expression] = []
-                    if isinstance(unique_key, exp.Tuple):
-                        key_columns = list(unique_key.expressions)
-                    elif isinstance(unique_key, (exp.Column, exp.Identifier)):
-                        key_columns = [unique_key]
-                    elif isinstance(unique_key, exp.Literal):
-                        key_columns = [exp.to_column(unique_key.this)]
-                    elif isinstance(unique_key, str):
-                        key_columns = [exp.to_column(unique_key)]
-                    else:
-                        # Fallback to string conversion
-                        key_columns = [exp.to_column(str(unique_key))]
-
-                    cols_sql = ", ".join(col.sql(dialect=self.dialect, identify=True) for col in key_columns)
-                    doris_inline_clauses.append(f"KEY ({cols_sql})")
-
-            if doris_inline_clauses:
-                insert_text = " ".join(doris_inline_clauses)
-                paren_start = create_sql.find("(")
-                insert_pos = -1
-                if paren_start != -1:
-                    depth = 0
-                    for i in range(paren_start, len(create_sql)):
-                        ch = create_sql[i]
-                        if ch == "(":
-                            depth += 1
-                        elif ch == ")":
-                            depth -= 1
-                            if depth == 0:
-                                insert_pos = i + 1
-                                break
-                if insert_pos == -1:
-                    after_mv = create_sql.find("CREATE MATERIALIZED VIEW")
-                    if after_mv != -1:
-                        as_idx = create_sql.find(" AS ")
-                        insert_pos = as_idx if as_idx != -1 else len(create_sql)
-                    else:
-                        insert_pos = 0
-                create_sql = f"{create_sql[:insert_pos]} {insert_text}{create_sql[insert_pos:]}"
-
-            self.execute(create_sql)
+            self.execute(create_exp)
 
     def drop_view(
         self,
@@ -372,7 +554,6 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
         """
         Drop view in Doris.
         """
-        # Remove cascade from kwargs as Doris doesn't support it
         if materialized and kwargs.get("view_properties"):
             view_properties = kwargs.pop("view_properties")
             if view_properties.get("materialized_type") == "SYNC" and view_properties.get("source_table"):
@@ -511,100 +692,115 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
         t2_col = exp.column(column.name, table="_t2")
         return t1_col.neq(t2_col) if is_not_in else t1_col.eq(t2_col)
 
-    def replace_query(
-        self,
-        table_name: "TableName",
-        query_or_df: "QueryOrDF",
-        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
-        table_description: t.Optional[str] = None,
-        column_descriptions: t.Optional[t.Dict[str, str]] = None,
-        source_columns: t.Optional[t.List[str]] = None,
-        **kwargs: t.Any,
-    ) -> None:
-        """
-        Doris does not support REPLACE TABLE. Avoid CTAS on replace and always perform a
-        delete+insert (or engine strategy) to ensure data is written even if the table exists.
-        """
-        target_table = exp.to_table(table_name)
-        source_queries, inferred_columns_to_types = self._get_source_queries_and_columns_to_types(
-            query_or_df,
-            target_columns_to_types,
-            target_table=target_table,
-            source_columns=source_columns,
-        )
-        target_columns_to_types = inferred_columns_to_types or self.columns(target_table)
-        # Use the standard insert-overwrite-by-condition path (DELETE/INSERT for Doris by default)
-        return self._insert_overwrite_by_condition(
-            target_table,
-            source_queries,
-            target_columns_to_types,
-        )
+    # def replace_query(
+    #     self,
+    #     table_name: TableName,
+    #     query_or_df: QueryOrDF,
+    #     target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+    #     table_description: t.Optional[str] = None,
+    #     column_descriptions: t.Optional[t.Dict[str, str]] = None,
+    #     source_columns: t.Optional[t.List[str]] = None,
+    #     supports_replace_table_override: t.Optional[bool] = None,
+    #     **kwargs: t.Any,
+    # ) -> None:
+    #     """
+    #     Doris does not support REPLACE TABLE. Avoid CTAS on replace and always perform a
+    #     delete+insert (or engine strategy) to ensure data is written even if the table exists.
+    #     """
+    #     target_table = exp.to_table(table_name)
+    #     source_queries, inferred_columns_to_types = self._get_source_queries_and_columns_to_types(
+    #         query_or_df,
+    #         target_columns_to_types,
+    #         target_table=target_table,
+    #         source_columns=source_columns,
+    #     )
+    #     # If the target table doesn't exist yet, create it from the source query first
+    #     if not self.table_exists(target_table):
+    #         # Create the table using the base helper which will handle CTAS / schema-first + insert
+    #         self._create_table_from_source_queries(
+    #             target_table,
+    #             source_queries,
+    #             inferred_columns_to_types,
+    #             exists=False,
+    #             table_description=table_description,
+    #             column_descriptions=column_descriptions,
+    #             **kwargs,
+    #         )
+    #         return
 
-    def _values_to_sql(
-        self,
-        values: t.List[t.Tuple[t.Any, ...]],
-        target_columns_to_types: t.Dict[str, exp.DataType],
-        batch_start: int,
-        batch_end: int,
-        alias: str = "t",
-        source_columns: t.Optional[t.List[str]] = None,
-    ) -> "Query":
-        """
-        Build a SELECT/UNION ALL subquery for a batch of literal rows.
+    #     target_columns_to_types = inferred_columns_to_types or self.columns(target_table)
+    #     # Use the standard insert-overwrite-by-condition path (DELETE/INSERT for Doris by default)
+    #     return self._insert_overwrite_by_condition(
+    #         target_table,
+    #         source_queries,
+    #         target_columns_to_types,
+    #     )
 
-        Doris (MySQL-compatible) doesn't reliably render SQLGlot's VALUES in FROM when using the
-        'doris' dialect, which led to an empty `(SELECT)` subquery. To avoid that, construct a
-        dialect-agnostic union of SELECT literals and then cast/order in an outer SELECT.
-        """
-        source_columns = source_columns or list(target_columns_to_types)
-        source_columns_to_types = get_source_columns_to_types(target_columns_to_types, source_columns)
+    # def _values_to_sql(
+    #     self,
+    #     values: t.List[t.Tuple[t.Any, ...]],
+    #     target_columns_to_types: t.Dict[str, exp.DataType],
+    #     batch_start: int,
+    #     batch_end: int,
+    #     alias: str = "t",
+    #     source_columns: t.Optional[t.List[str]] = None,
+    # ) -> "Query":
+    #     """
+    #     Build a SELECT/UNION ALL subquery for a batch of literal rows.
 
-        row_values = values[batch_start:batch_end]
+    #     Doris (MySQL-compatible) doesn't reliably render SQLGlot's VALUES in FROM when using the
+    #     'doris' dialect, which led to an empty `(SELECT)` subquery. To avoid that, construct a
+    #     dialect-agnostic union of SELECT literals and then cast/order in an outer SELECT.
+    #     """
+    #     source_columns = source_columns or list(target_columns_to_types)
+    #     source_columns_to_types = get_source_columns_to_types(target_columns_to_types, source_columns)
 
-        inner: exp.Query
-        if not row_values:
-            # Produce a zero-row subquery with the correct schema
-            zero_row_select = exp.select(
-                *[
-                    exp.cast(exp.null(), to=col_type).as_(col, quoted=True)
-                    for col, col_type in source_columns_to_types.items()
-                ]
-            ).where(exp.false())
-            inner = zero_row_select
-        else:
-            # Build UNION ALL of SELECT <literals AS columns>
-            selects: t.List[exp.Select] = []
-            for row in row_values:
-                converted_vals = list(transform_values(row, source_columns_to_types))
-                select_exprs = [
-                    exp.alias_(val, col, quoted=True)
-                    for val, col in zip(converted_vals, source_columns_to_types.keys())
-                ]
-                selects.append(exp.select(*select_exprs))
+    #     row_values = values[batch_start:batch_end]
 
-            inner = selects[0]
-            for s in selects[1:]:
-                inner = exp.union(inner, s, distinct=False)
+    #     inner: exp.Query
+    #     if not row_values:
+    #         # Produce a zero-row subquery with the correct schema
+    #         zero_row_select = exp.select(
+    #             *[
+    #                 exp.cast(exp.null(), to=col_type).as_(col, quoted=True)
+    #                 for col, col_type in source_columns_to_types.items()
+    #             ]
+    #         ).where(exp.false())
+    #         inner = zero_row_select
+    #     else:
+    #         # Build UNION ALL of SELECT <literals AS columns>
+    #         selects: t.List[exp.Select] = []
+    #         for row in row_values:
+    #             converted_vals = list(transform_values(row, source_columns_to_types))
+    #             select_exprs = [
+    #                 exp.alias_(val, col, quoted=True)
+    #                 for val, col in zip(converted_vals, source_columns_to_types.keys())
+    #             ]
+    #             selects.append(exp.select(*select_exprs))
 
-        # Outer select to coerce/order target columns
-        casted_columns = [
-            exp.alias_(
-                exp.cast(
-                    exp.column(column, table=alias, quoted=True) if column in source_columns_to_types else exp.Null(),
-                    to=kind,
-                ),
-                column,
-                quoted=True,
-            )
-            for column, kind in target_columns_to_types.items()
-        ]
+    #         inner = selects[0]
+    #         for s in selects[1:]:
+    #             inner = exp.union(inner, s, distinct=False)
 
-        final_query = exp.select(*casted_columns).from_(
-            exp.alias_(exp.Subquery(this=inner), alias, table=True),
-            copy=False,
-        )
+    #     # Outer select to coerce/order target columns
+    #     casted_columns = [
+    #         exp.alias_(
+    #             exp.cast(
+    #                 exp.column(column, table=alias, quoted=True) if column in source_columns_to_types else exp.Null(),
+    #                 to=kind,
+    #             ),
+    #             column,
+    #             quoted=True,
+    #         )
+    #         for column, kind in target_columns_to_types.items()
+    #     ]
 
-        return final_query
+    #     final_query = exp.select(*casted_columns).from_(
+    #         exp.alias_(exp.Subquery(this=inner), alias, table=True),
+    #         copy=False,
+    #     )
+
+    #     return final_query
 
     def _create_table_from_columns(
         self,
@@ -657,10 +853,24 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         catalog_name: t.Optional[str] = None,
         **kwargs: t.Any,
-    ) -> t.Optional[t.Union[exp.PartitionedByProperty, exp.PartitionByRangeProperty, exp.Property]]:
-        """Doris supports range and list partition, but sqlglot only supports range partition."""
+    ) -> t.Optional[
+        t.Union[
+            exp.PartitionedByProperty,
+            exp.PartitionByRangeProperty,
+            exp.PartitionByListProperty,
+            exp.Property,
+        ]
+    ]:
+        """Build Doris partitioning expression.
+
+        Supports both RANGE and LIST partition syntaxes using sqlglot's doris dialect nodes.
+        The partition kind is chosen by:
+        - kwargs["partition_kind"] if provided (expects 'RANGE' or 'LIST', case-insensitive)
+        - otherwise inferred from the provided 'partitions' strings: if any contains 'VALUES IN' -> LIST; else RANGE.
+        """
         partitions = kwargs.get("partitions")
         create_expressions = None
+        partition_kind: t.Optional[str] = kwargs.get("partition_kind")
 
         def to_raw_sql(expr: t.Union[exp.Literal, exp.Var, str, t.Any]) -> exp.Var:
             # If it's a Literal, extract the string and wrap as Var (no quotes)
@@ -686,10 +896,40 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
             else:
                 create_expressions = [to_raw_sql(partitions)]
 
-        return exp.PartitionByRangeProperty(
-            partition_expressions=partitioned_by,
-            create_expressions=create_expressions,
-        )
+        # Infer partition kind from partitions text if not explicitly provided
+        inferred_list = False
+        if partition_kind is None and create_expressions:
+            try:
+                texts = [getattr(e, "this", "").upper() for e in create_expressions]
+                inferred_list = any("VALUES IN" in t for t in texts)
+            except Exception:
+                inferred_list = False
+        if partition_kind:
+            kind_upper = str(partition_kind).upper()
+            is_list = kind_upper == "LIST"
+        else:
+            is_list = inferred_list
+
+        try:
+            if is_list:
+                return exp.PartitionByListProperty(
+                    this=exp.Schema(expressions=partitioned_by),
+                    partitions=create_expressions,
+                )
+            return exp.PartitionByRangeProperty(
+                partition_expressions=partitioned_by,
+                create_expressions=create_expressions,
+            )
+        except TypeError:
+            if is_list:
+                return exp.PartitionByListProperty(
+                    partition_expressions=partitioned_by,
+                    create_expressions=create_expressions,
+                )
+            return exp.PartitionByRangeProperty(
+                partition_expressions=partitioned_by,
+                create_expressions=create_expressions,
+            )
 
     def _build_table_properties_exp(
         self,

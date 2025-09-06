@@ -24,7 +24,7 @@ dependencies = [
     "requests",
     "rich[jupyter]",
     "ruamel.yaml",
-    "sqlglot[rs]~=27.9.0",
+    "sqlglot[rs]~=27.12.0",
     "tenacity",
     "time-machine",
     "json-stream"
@@ -85,7 +85,7 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-mock",
-    "pytest-retry",
+    "pytest-rerunfailures",
     "pytest-xdist",
     "pytz",
     "redshift_connector",
@@ -265,9 +265,14 @@ markers = [
     "redshift: test for Redshift",
     "snowflake: test for Snowflake",
     "spark: test for Spark",
+    "pyspark: test for PySpark that need to run separately from the other spark tests",
     "trino: test for Trino (all connectors)",
     "risingwave: test for Risingwave",
     "doris: test for Doris",
+
+    # Other
+    "set_default_connection",
+    "registry_isolation"
 ]
 addopts = "-n 0 --dist=loadgroup"
 asyncio_default_fixture_loop_scope = "session"
@@ -277,7 +282,7 @@ log_cli_level = "INFO"
 filterwarnings = [
     "ignore:The localize method is no longer necessary, as this time zone supports the fold attribute"
 ]
-retry_delay = 10
+reruns_delay = 10
 
 [tool.ruff]
 line-length = 100

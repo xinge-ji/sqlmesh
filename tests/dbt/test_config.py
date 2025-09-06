@@ -137,6 +137,7 @@ def test_model_to_sqlmesh_fields(dbt_dummy_postgres_config: PostgresConfig):
     assert model.dialect == "postgres"
     assert model.owner == "Sally"
     assert model.tags == ["test", "incremental"]
+    assert model.allow_partials
     kind = t.cast(IncrementalByUniqueKeyKind, model.kind)
     assert kind.batch_size == 5
     assert kind.lookback == 3
@@ -276,42 +277,6 @@ def test_singular_test_to_standalone_audit(dbt_dummy_postgres_config: PostgresCo
     assert standalone_audit.dialect == "bigquery"
 
 
-def test_model_config_sql_no_config():
-    assert (
-        ModelConfig(
-            sql="""{{
-  config(
-    materialized='table',
-    incremental_strategy='delete+"insert'
-  )
-}}
-query"""
-        ).sql_no_config.strip()
-        == "query"
-    )
-
-    assert (
-        ModelConfig(
-            sql="""{{
-  config(
-    materialized='table',
-    incremental_strategy='delete+insert',
-    post_hook=" '{{ var('new') }}' "
-  )
-}}
-query"""
-        ).sql_no_config.strip()
-        == "query"
-    )
-
-    assert (
-        ModelConfig(
-            sql="""before {{config(materialized='table', post_hook=" {{ var('new') }} ")}} after"""
-        ).sql_no_config.strip()
-        == "before  after"
-    )
-
-
 @pytest.mark.slow
 def test_variables(assert_exp_eq, sushi_test_project):
     # Case 1: using an undefined variable without a default value
@@ -350,7 +315,6 @@ def test_variables(assert_exp_eq, sushi_test_project):
 
     # Case 3: using a defined variable with a default value
     model_config.sql = "SELECT {{ var('foo', 5) }}"
-    model_config._sql_no_config = None
 
     assert_exp_eq(model_config.to_sqlmesh(**kwargs).render_query(), 'SELECT 6 AS "6"')
 
@@ -444,7 +408,7 @@ def test_source_config(sushi_test_project: Project):
 @pytest.mark.slow
 def test_seed_config(sushi_test_project: Project, mocker: MockerFixture):
     seed_configs = sushi_test_project.packages["sushi"].seeds
-    assert set(seed_configs) == {"waiter_names"}
+    assert set(seed_configs) == {"waiter_names", "waiter_revenue_semicolon"}
     raw_items_seed = seed_configs["waiter_names"]
 
     expected_config = {
@@ -464,6 +428,25 @@ def test_seed_config(sushi_test_project: Project, mocker: MockerFixture):
         raw_items_seed.to_sqlmesh(sushi_test_project.context).fqn
         == '"MEMORY"."SUSHI"."WAITER_NAMES"'
     )
+
+    waiter_revenue_semicolon_seed = seed_configs["waiter_revenue_semicolon"]
+
+    expected_config_semicolon = {
+        "path": Path(sushi_test_project.context.project_root, "seeds/waiter_revenue_semicolon.csv"),
+        "schema_": "sushi",
+        "delimiter": ";",
+    }
+    actual_config_semicolon = {
+        k: getattr(waiter_revenue_semicolon_seed, k) for k, v in expected_config_semicolon.items()
+    }
+    assert actual_config_semicolon == expected_config_semicolon
+
+    assert waiter_revenue_semicolon_seed.canonical_name(context) == "sushi.waiter_revenue_semicolon"
+    assert (
+        waiter_revenue_semicolon_seed.to_sqlmesh(context).name == "sushi.waiter_revenue_semicolon"
+    )
+    assert waiter_revenue_semicolon_seed.delimiter == ";"
+    assert set(waiter_revenue_semicolon_seed.columns.keys()) == {"waiter_id", "revenue", "quarter"}
 
 
 def test_quoting():

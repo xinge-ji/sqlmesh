@@ -16,8 +16,10 @@ from sqlglot import Dialect
 
 from sqlmesh.core.console import get_console
 from sqlmesh.core.engine_adapter import EngineAdapter
+from sqlmesh.core.model.definition import SqlModel
 from sqlmesh.core.snapshot.definition import DeployabilityIndex
 from sqlmesh.dbt.adapter import BaseAdapter, ParsetimeAdapter, RuntimeAdapter
+from sqlmesh.dbt.common import RAW_CODE_KEY
 from sqlmesh.dbt.relation import Policy
 from sqlmesh.dbt.target import TARGET_TYPE_TO_CONFIG_CLASS
 from sqlmesh.dbt.util import DBT_VERSION
@@ -162,6 +164,74 @@ class Var:
 
     def has_var(self, name: str) -> bool:
         return name in self.variables
+
+
+class Config:
+    def __init__(self, config_dict: t.Dict[str, t.Any]) -> None:
+        self._config = config_dict
+
+    def __call__(self, *args: t.Any, **kwargs: t.Any) -> str:
+        if args and kwargs:
+            raise ConfigError(
+                "Invalid inline model config: cannot mix positional and keyword arguments"
+            )
+
+        if args:
+            if len(args) == 1 and isinstance(args[0], dict):
+                # Single dict argument: config({"materialized": "table"})
+                self._config.update(args[0])
+            else:
+                raise ConfigError(
+                    f"Invalid inline model config: expected a single dictionary, got {len(args)} arguments"
+                )
+        elif kwargs:
+            # Keyword arguments: config(materialized="table")
+            self._config.update(kwargs)
+
+        return ""
+
+    def set(self, name: str, value: t.Any) -> str:
+        self._config.update({name: value})
+        return ""
+
+    def _validate(self, name: str, validator: t.Callable, value: t.Optional[t.Any] = None) -> None:
+        try:
+            validator(value)
+        except Exception as e:
+            raise ConfigError(f"Config validation failed for '{name}': {e}")
+
+    def require(self, name: str, validator: t.Optional[t.Callable] = None) -> t.Any:
+        if name not in self._config:
+            raise ConfigError(f"Missing required config: {name}")
+
+        value = self._config[name]
+
+        if validator is not None:
+            self._validate(name, validator, value)
+
+        return value
+
+    def get(
+        self, name: str, default: t.Any = None, validator: t.Optional[t.Callable] = None
+    ) -> t.Any:
+        value = self._config.get(name, default)
+
+        if validator is not None and value is not None:
+            self._validate(name, validator, value)
+
+        return value
+
+    def persist_relation_docs(self) -> bool:
+        persist_docs = self.get("persist_docs", default={})
+        if not isinstance(persist_docs, dict):
+            return False
+        return persist_docs.get("relation", False)
+
+    def persist_column_docs(self) -> bool:
+        persist_docs = self.get("persist_docs", default={})
+        if not isinstance(persist_docs, dict):
+            return False
+        return persist_docs.get("columns", False)
 
 
 def env_var(name: str, default: t.Optional[str] = None) -> t.Optional[str]:
@@ -395,6 +465,8 @@ def create_builtin_globals(
     if variables is not None:
         builtin_globals["var"] = Var(variables)
 
+    builtin_globals["config"] = Config(jinja_globals.pop("config", {}))
+
     deployability_index = (
         jinja_globals.get("deployability_index") or DeployabilityIndex.all_deployable()
     )
@@ -415,11 +487,20 @@ def create_builtin_globals(
             is_incremental &= snapshot_table_exists
     else:
         is_incremental = False
+
     builtin_globals["is_incremental"] = lambda: is_incremental
 
     builtin_globals["builtins"] = AttributeDict(
         {k: builtin_globals.get(k) for k in ("ref", "source", "config", "var")}
     )
+
+    if (model := jinja_globals.pop("model", None)) is not None:
+        if isinstance(model_instance := jinja_globals.pop("model_instance", None), SqlModel):
+            builtin_globals["model"] = AttributeDict(
+                {**model, RAW_CODE_KEY: model_instance.query.name}
+            )
+        else:
+            builtin_globals["model"] = AttributeDict(model.copy())
 
     if engine_adapter is not None:
         builtin_globals["flags"] = Flags(which="run")

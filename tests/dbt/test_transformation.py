@@ -10,6 +10,7 @@ from sqlmesh.dbt.util import DBT_VERSION
 
 import pytest
 from dbt.adapters.base import BaseRelation
+from jinja2 import Template
 
 if DBT_VERSION >= (1, 4, 0):
     from dbt.exceptions import CompilationError
@@ -42,7 +43,7 @@ from sqlmesh.core.model.kind import (
     OnAdditiveChange,
 )
 from sqlmesh.core.state_sync.db.snapshot import _snapshot_to_json
-from sqlmesh.dbt.builtin import _relation_info_to_relation
+from sqlmesh.dbt.builtin import _relation_info_to_relation, Config
 from sqlmesh.dbt.common import Dependencies
 from sqlmesh.dbt.column import (
     ColumnConfig,
@@ -806,6 +807,58 @@ def test_seed_partial_column_inference(tmp_path):
     assert list(seed_df.columns) == list(sqlmesh_seed.columns_to_types.keys())
 
 
+def test_seed_delimiter(tmp_path):
+    seed_csv = tmp_path / "seed_with_delimiter.csv"
+
+    with open(seed_csv, "w", encoding="utf-8") as fd:
+        fd.writelines("\n".join(["id|name|city", "0|Ayrton|SP", "1|Max|MC", "2|Niki|VIE"]))
+
+    seed = SeedConfig(
+        name="test_model_pipe",
+        package="package",
+        path=Path(seed_csv),
+        delimiter="|",
+    )
+
+    context = DbtContext()
+    context.project_name = "TestProject"
+    context.target = DuckDbConfig(name="target", schema="test")
+    sqlmesh_seed = seed.to_sqlmesh(context)
+
+    # Verify columns are correct with the custom pipe (|) delimiter
+    expected_columns = {"id", "name", "city"}
+    assert set(sqlmesh_seed.columns_to_types.keys()) == expected_columns
+
+    seed_df = next(sqlmesh_seed.render_seed())
+    assert list(seed_df.columns) == list(sqlmesh_seed.columns_to_types.keys())
+    assert len(seed_df) == 3
+
+    assert seed_df.iloc[0]["name"] == "Ayrton"
+    assert seed_df.iloc[0]["city"] == "SP"
+    assert seed_df.iloc[1]["name"] == "Max"
+    assert seed_df.iloc[1]["city"] == "MC"
+
+    # test with semicolon delimiter
+    seed_csv_semicolon = tmp_path / "seed_with_semicolon.csv"
+    with open(seed_csv_semicolon, "w", encoding="utf-8") as fd:
+        fd.writelines("\n".join(["id;value;status", "1;100;active", "2;200;inactive"]))
+
+    seed_semicolon = SeedConfig(
+        name="test_model_semicolon",
+        package="package",
+        path=Path(seed_csv_semicolon),
+        delimiter=";",
+    )
+
+    sqlmesh_seed_semicolon = seed_semicolon.to_sqlmesh(context)
+    expected_columns_semicolon = {"id", "value", "status"}
+    assert set(sqlmesh_seed_semicolon.columns_to_types.keys()) == expected_columns_semicolon
+
+    seed_df_semicolon = next(sqlmesh_seed_semicolon.render_seed())
+    assert seed_df_semicolon.iloc[0]["value"] == 100
+    assert seed_df_semicolon.iloc[0]["status"] == "active"
+
+
 def test_seed_column_order(tmp_path):
     seed_csv = tmp_path / "seed.csv"
 
@@ -911,6 +964,45 @@ def test_hooks(sushi_test_dbt_context: Context, model_fqn: str):
 
 
 @pytest.mark.xdist_group("dbt_manifest")
+def test_seed_delimiter_integration(sushi_test_dbt_context: Context):
+    seed_fqn = '"memory"."sushi"."waiter_revenue_semicolon"'
+    assert seed_fqn in sushi_test_dbt_context.models
+
+    seed_model = sushi_test_dbt_context.models[seed_fqn]
+    assert seed_model.columns_to_types is not None
+
+    # this should be loaded with semicolon delimiter otherwise it'd resylt in an one column table
+    assert set(seed_model.columns_to_types.keys()) == {"waiter_id", "revenue", "quarter"}
+
+    # columns_to_types values are correct types as well
+    assert seed_model.columns_to_types == {
+        "waiter_id": exp.DataType.build("int"),
+        "revenue": exp.DataType.build("double"),
+        "quarter": exp.DataType.build("text"),
+    }
+
+    df = sushi_test_dbt_context.fetchdf(f"SELECT * FROM {seed_fqn}")
+
+    assert len(df) == 6
+    waiter_ids = set(df["waiter_id"].tolist())
+    quarters = set(df["quarter"].tolist())
+    assert waiter_ids == {1, 2, 3}
+    assert quarters == {"Q1", "Q2"}
+
+    q1_w1_rows = df[(df["waiter_id"] == 1) & (df["quarter"] == "Q1")]
+    assert len(q1_w1_rows) == 1
+    assert float(q1_w1_rows.iloc[0]["revenue"]) == 100.50
+
+    q2_w2_rows = df[(df["waiter_id"] == 2) & (df["quarter"] == "Q2")]
+    assert len(q2_w2_rows) == 1
+    assert float(q2_w2_rows.iloc[0]["revenue"]) == 225.50
+
+    q2_w3_rows = df[(df["waiter_id"] == 3) & (df["quarter"] == "Q2")]
+    assert len(q2_w3_rows) == 1
+    assert float(q2_w3_rows.iloc[0]["revenue"]) == 175.75
+
+
+@pytest.mark.xdist_group("dbt_manifest")
 def test_target_jinja(sushi_test_project: Project):
     context = sushi_test_project.context
 
@@ -946,7 +1038,7 @@ def test_schema_jinja(sushi_test_project: Project, assert_exp_eq):
 
 @pytest.mark.xdist_group("dbt_manifest")
 def test_config_jinja(sushi_test_project: Project):
-    hook = "{{ config(alias='bar') }} {{ config.alias }}"
+    hook = "{{ config(alias='bar') }} {{ config.get('alias') }}"
     model_config = ModelConfig(
         name="model",
         package_name="package",
@@ -959,6 +1051,211 @@ def test_config_jinja(sushi_test_project: Project):
     model = t.cast(SqlModel, model_config.to_sqlmesh(context))
     assert hook in model.pre_statements[0].sql()
     assert model.render_pre_statements()[0].sql() == '"bar"'
+
+
+@pytest.mark.xdist_group("dbt_manifest")
+def test_config_dict_syntax():
+    # Test dictionary syntax
+    config = Config({})
+    result = config({"materialized": "table", "alias": "dict_table"})
+    assert result == ""
+    assert config._config["materialized"] == "table"
+    assert config._config["alias"] == "dict_table"
+
+    # Test kwargs syntax still works
+    config2 = Config({})
+    result = config2(materialized="view", alias="kwargs_table")
+    assert result == ""
+    assert config2._config["materialized"] == "view"
+    assert config2._config["alias"] == "kwargs_table"
+
+    # Test that mixing args and kwargs is rejected
+    config3 = Config({})
+    try:
+        config3({"materialized": "table"}, alias="mixed")
+        assert False, "Should have raised ConfigError"
+    except Exception as e:
+        assert "cannot mix positional and keyword arguments" in str(e)
+
+    # Test nested dicts
+    config4 = Config({})
+    config4({"meta": {"owner": "data_team", "priority": 1}, "tags": ["daily", "critical"]})
+    assert config4._config["meta"]["owner"] == "data_team"
+    assert config4._config["tags"] == ["daily", "critical"]
+
+    # Test multiple positional arguments are rejected
+    config4 = Config({})
+    try:
+        config4({"materialized": "table"}, {"alias": "test"})
+        assert False
+    except Exception as e:
+        assert "expected a single dictionary, got 2 arguments" in str(e)
+
+
+def test_config_dict_in_jinja():
+    # Test dict syntax directly with Config class
+    config = Config({})
+    template = Template("{{ config({'materialized': 'table', 'unique_key': 'id'}) }}done")
+    result = template.render(config=config)
+    assert result == "done"
+    assert config._config["materialized"] == "table"
+    assert config._config["unique_key"] == "id"
+
+    # Test with nested dict and list values
+    config2 = Config({})
+    complex_template = Template("""{{ config({
+        'tags': ['test', 'dict'],
+        'meta': {'owner': 'data_team'}
+    }) }}result""")
+    result = complex_template.render(config=config2)
+    assert result == "result"
+    assert config2._config["tags"] == ["test", "dict"]
+    assert config2._config["meta"]["owner"] == "data_team"
+
+    # Test that kwargs still work
+    config3 = Config({})
+    kwargs_template = Template("{{ config(materialized='view', alias='my_view') }}done")
+    result = kwargs_template.render(config=config3)
+    assert result == "done"
+    assert config3._config["materialized"] == "view"
+    assert config3._config["alias"] == "my_view"
+
+
+@pytest.mark.xdist_group("dbt_manifest")
+def test_config_dict_syntax_in_sushi_project(sushi_test_project: Project):
+    assert sushi_test_project is not None
+    assert sushi_test_project.context is not None
+
+    sushi_package = sushi_test_project.packages.get("sushi")
+    assert sushi_package is not None
+
+    top_waiters_found = False
+    for model_config in sushi_package.models.values():
+        if model_config.name == "top_waiters":
+            # top_waiters model now uses dict config syntax with:
+            # config({'materialized': 'view', 'limit_value': var('top_waiters:limit'), 'meta': {...}})
+            top_waiters_found = True
+            assert model_config.materialized == "view"
+            assert model_config.meta is not None
+            assert model_config.meta.get("owner") == "analytics_team"
+            assert model_config.meta.get("priority") == "high"
+            break
+
+    assert top_waiters_found
+
+
+@pytest.mark.xdist_group("dbt_manifest")
+def test_config_jinja_get_methods(sushi_test_project: Project):
+    model_config = ModelConfig(
+        name="model_conf",
+        package_name="package",
+        schema="sushi",
+        sql="""SELECT 1 AS one FROM foo""",
+        alias="model_alias",
+        **{
+            "pre-hook": [
+                "{{ config(materialized='incremental', unique_key='id') }}"
+                "{{ config.get('missed', 'a') + config.get('missed', default='b')}}",
+                "{{ config.set('alias', 'new_alias')}}",
+                "{{ config.get('package_name') + '_' + config.require('unique_key')}}",
+                "{{ config.get('alias') or 'default'}}",
+            ]
+        },
+        **{"post-hook": "{{config.require('missing_key')}}"},
+    )
+    context = sushi_test_project.context
+    model = t.cast(SqlModel, model_config.to_sqlmesh(context))
+
+    assert model.render_pre_statements()[0].sql() == '"ab"'
+    assert model.render_pre_statements()[1].sql() == '"package_id"'
+    assert model.render_pre_statements()[2].sql() == '"new_alias"'
+
+    with pytest.raises(ConfigError, match="Missing required config: missing_key"):
+        model.render_post_statements()
+
+    # test get methods with operations
+    model_2_config = ModelConfig(
+        name="model_2",
+        package_name="package",
+        schema="sushi",
+        sql="""SELECT 1 AS one FROM foo""",
+        alias="mod",
+        materialized="table",
+        threads=8,
+        partition_by="date",
+        cluster_by=["user_id", "product_id"],
+        **{
+            "pre-hook": [
+                "{{ config.get('partition_by', default='none') }}",
+                "{{ config.get('cluster_by', default=[]) | length }}",
+                "{% if config.get('threads') > 4 %}high_threads{% else %}low_threads{% endif %}",
+            ]
+        },
+    )
+    model2 = t.cast(SqlModel, model_2_config.to_sqlmesh(context))
+
+    pre_statements2 = model2.render_pre_statements()
+    assert pre_statements2[0].sql() == "ARRAY('date')"
+    assert pre_statements2[1].sql() == "2"
+    assert pre_statements2[2].sql() == '"high_threads"'
+
+    # test seting variable and conditional
+    model_invalid_timeout = ModelConfig(
+        name="invalid_timeout_test",
+        package_name="package",
+        schema="sushi",
+        sql="""SELECT 1 AS one FROM foo""",
+        alias="invalid_timeout_alias",
+        connection_timeout=44,
+        **{
+            "pre-hook": [
+                """
+            {%- set value = config.require('connection_timeout') -%}
+            {%- set is_valid = value >= 10 and value <= 30 -%}
+            {%- if not is_valid -%}
+              {{ exceptions.raise_compiler_error("Validation failed for 'connection_timeout': Value must be between 10 and 30, got: " ~ value) }}
+            {%- endif -%}
+            {{ value }}
+            """,
+            ]
+        },
+    )
+
+    model_invalid = t.cast(SqlModel, model_invalid_timeout.to_sqlmesh(context))
+    with pytest.raises(
+        ConfigError,
+        match="Validation failed for 'connection_timeout': Value must be between 10 and 30, got: 44",
+    ):
+        model_invalid.render_pre_statements()
+
+    # test persist_docs methods
+    model_config_persist = ModelConfig(
+        name="persist_docs_model",
+        package_name="package",
+        schema="sushi",
+        sql="""SELECT 1 AS one FROM foo""",
+        alias="persist_alias",
+        **{
+            "pre-hook": [
+                "{{ config(persist_docs={'relation': true, 'columns': true}) }}",
+                "{{ config.persist_relation_docs() }}",
+                "{{ config.persist_column_docs() }}",
+                "{{ config(persist_docs={'relation': false, 'columns': true}) }}",
+                "{{ config.persist_relation_docs() }}",
+                "{{ config.persist_column_docs() }}",
+            ]
+        },
+    )
+    model3 = t.cast(SqlModel, model_config_persist.to_sqlmesh(context))
+
+    pre_statements3 = model3.render_pre_statements()
+
+    # it should filter out empty returns, so we get 4 statements
+    assert len(pre_statements3) == 4
+    assert pre_statements3[0].sql() == "TRUE"
+    assert pre_statements3[1].sql() == "TRUE"
+    assert pre_statements3[2].sql() == "FALSE"
+    assert pre_statements3[3].sql() == "TRUE"
 
 
 @pytest.mark.xdist_group("dbt_manifest")
@@ -1355,6 +1652,9 @@ def test_partition_by(sushi_test_project: Project):
     model_config.partition_by = {"field": "ds", "data_type": "date", "granularity": "day"}
     assert model_config.to_sqlmesh(context).partitioned_by == [exp.to_column("ds", quoted=True)]
 
+    context.target = DuckDbConfig(name="target", schema="foo")
+    assert model_config.to_sqlmesh(context).partitioned_by == []
+
 
 @pytest.mark.xdist_group("dbt_manifest")
 def test_partition_by_none(sushi_test_project: Project):
@@ -1723,6 +2023,17 @@ def test_model_cluster_by():
         exp.to_column('"QUX"'),
     ]
 
+    model = ModelConfig(
+        name="model",
+        alias="model",
+        package_name="package",
+        target_schema="test",
+        cluster_by=["Bar", "qux"],
+        sql="SELECT * FROM baz",
+        materialized=Materialization.VIEW.value,
+    )
+    assert model.to_sqlmesh(context).clustered_by == []
+
 
 def test_snowflake_dynamic_table():
     context = DbtContext()
@@ -1799,11 +2110,11 @@ def test_allow_partials_by_default():
         sql="SELECT * FROM baz",
         materialized=Materialization.TABLE.value,
     )
-    assert model.allow_partials is None
+    assert model.allow_partials
     assert model.to_sqlmesh(context).allow_partials
 
     model.materialized = Materialization.INCREMENTAL.value
-    assert model.allow_partials is None
+    assert model.allow_partials
     assert model.to_sqlmesh(context).allow_partials
 
     model.allow_partials = True

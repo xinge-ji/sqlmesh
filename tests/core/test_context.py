@@ -39,6 +39,7 @@ from sqlmesh.core.environment import Environment, EnvironmentNamingInfo, Environ
 from sqlmesh.core.plan.definition import Plan
 from sqlmesh.core.macros import MacroEvaluator, RuntimeStage
 from sqlmesh.core.model import load_sql_based_model, model, SqlModel, Model
+from sqlmesh.core.model.common import ParsableSql
 from sqlmesh.core.model.cache import OptimizedQueryCache
 from sqlmesh.core.renderer import render_statements
 from sqlmesh.core.model.kind import ModelKindName
@@ -1533,6 +1534,26 @@ def test_plan_enable_preview_default(sushi_context: Context, sushi_dbt_context: 
     assert sushi_dbt_context._plan_preview_enabled
 
 
+@pytest.mark.slow
+def test_raw_code_handling(sushi_test_dbt_context: Context):
+    model = sushi_test_dbt_context.models['"memory"."sushi"."model_with_raw_code"']
+    assert "raw_code" not in model.jinja_macros.global_objs["model"]  # type: ignore
+
+    # logging "pre-hook" (in dbt_projects.yml) + the actual pre-hook in the model file
+    assert len(model.pre_statements) == 2
+
+    original_file_path = model.jinja_macros.global_objs["model"]["original_file_path"]  # type: ignore
+    model_file_path = sushi_test_dbt_context.path / original_file_path
+
+    raw_code_length = len(model_file_path.read_text()) - 1
+
+    hook = model.render_pre_statements()[0]
+    assert (
+        hook.sql()
+        == f'''CREATE TABLE "t" AS SELECT 'Length is {raw_code_length}' AS "length_col"'''
+    )
+
+
 def test_catalog_name_needs_to_be_quoted():
     config = Config(
         model_defaults=ModelDefaultsConfig(dialect="duckdb"),
@@ -2303,7 +2324,10 @@ def test_prompt_if_uncategorized_snapshot(mocker: MockerFixture, tmp_path: Path)
     incremental_model = context.get_model("sqlmesh_example.incremental_model")
     incremental_model_query = incremental_model.render_query()
     new_incremental_model_query = t.cast(exp.Select, incremental_model_query).select("1 AS z")
-    context.upsert_model("sqlmesh_example.incremental_model", query=new_incremental_model_query)
+    context.upsert_model(
+        "sqlmesh_example.incremental_model",
+        query_=ParsableSql(sql=new_incremental_model_query.sql(dialect=incremental_model.dialect)),
+    )
 
     mock_console = mocker.Mock()
     spy_plan = mocker.spy(mock_console, "plan")

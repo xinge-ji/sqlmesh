@@ -16,6 +16,7 @@ from pytest import MonkeyPatch
 from pathlib import Path
 from sqlmesh.core.console import set_console, get_console, TerminalConsole
 from sqlmesh.core.config.naming import NameInferenceConfig
+from sqlmesh.core.model.common import ParsableSql
 from sqlmesh.utils.concurrency import NodeExecutionFailedError
 import time_machine
 from pytest_mock.plugin import MockerFixture
@@ -2023,7 +2024,7 @@ def test_dbt_select_star_is_directly_modified(sushi_test_dbt_context: Context):
     model = context.get_model("sushi.simple_model_a")
     context.upsert_model(
         model,
-        query=d.parse_one("SELECT 1 AS a, 2 AS b"),
+        query_=ParsableSql(sql="SELECT 1 AS a, 2 AS b"),
     )
 
     snapshot_a_id = context.get_snapshot("sushi.simple_model_a").snapshot_id  # type: ignore
@@ -2605,8 +2606,8 @@ def test_unaligned_start_snapshot_with_non_deployable_downstream(init_and_plan_c
     context.upsert_model(SqlModel.parse_obj(kwargs))
     context.upsert_model(
         downstream_model_name,
-        query=d.parse_one(
-            "SELECT customer_id, MAX(revenue) AS max_revenue FROM memory.sushi.customer_revenue_lifetime_new GROUP BY 1"
+        query_=ParsableSql(
+            sql="SELECT customer_id, MAX(revenue) AS max_revenue FROM memory.sushi.customer_revenue_lifetime_new GROUP BY 1"
         ),
     )
 
@@ -2637,7 +2638,13 @@ def test_virtual_environment_mode_dev_only(init_and_plan_context: t.Callable):
     # Make a change in dev
     original_model = context.get_model("sushi.waiter_revenue_by_day")
     original_fingerprint = context.get_snapshot(original_model.name).fingerprint
-    model = original_model.copy(update={"query": original_model.query.order_by("waiter_id")})
+    model = original_model.copy(
+        update={
+            "query_": ParsableSql(
+                sql=original_model.query.order_by("waiter_id").sql(dialect=original_model.dialect)
+            )
+        }
+    )
     model = add_projection_to_model(t.cast(SqlModel, model))
     context.upsert_model(model)
 
@@ -2909,6 +2916,81 @@ def test_virtual_environment_mode_dev_only_model_kind_change_manual_categorizati
             ],
         ),
     ]
+
+
+@time_machine.travel("2023-01-08 15:00:00 UTC")
+def test_virtual_environment_mode_dev_only_seed_model_change(
+    init_and_plan_context: t.Callable,
+):
+    context, _ = init_and_plan_context(
+        "examples/sushi", config="test_config_virtual_environment_mode_dev_only"
+    )
+    context.load()
+    context.plan("prod", auto_apply=True, no_prompts=True)
+
+    seed_model = context.get_model("sushi.waiter_names")
+    with open(seed_model.seed_path, "a") as fd:
+        fd.write("\n123,New Test Name")
+
+    context.load()
+    seed_model_snapshot = context.get_snapshot("sushi.waiter_names")
+    plan = context.plan_builder("dev").build()
+    assert plan.directly_modified == {seed_model_snapshot.snapshot_id}
+    assert len(plan.missing_intervals) == 2
+    context.apply(plan)
+
+    actual_seed_df_in_dev = context.fetchdf("SELECT * FROM sushi__dev.waiter_names WHERE id = 123")
+    assert actual_seed_df_in_dev.to_dict("records") == [{"id": 123, "name": "New Test Name"}]
+    actual_seed_df_in_prod = context.fetchdf("SELECT * FROM sushi.waiter_names WHERE id = 123")
+    assert actual_seed_df_in_prod.empty
+
+    plan = context.plan_builder("prod").build()
+    assert plan.directly_modified == {seed_model_snapshot.snapshot_id}
+    assert len(plan.missing_intervals) == 1
+    assert plan.missing_intervals[0].snapshot_id == seed_model_snapshot.snapshot_id
+    context.apply(plan)
+
+    actual_seed_df_in_prod = context.fetchdf("SELECT * FROM sushi.waiter_names WHERE id = 123")
+    assert actual_seed_df_in_prod.to_dict("records") == [{"id": 123, "name": "New Test Name"}]
+
+
+@time_machine.travel("2023-01-08 15:00:00 UTC")
+def test_virtual_environment_mode_dev_only_model_change_downstream_of_seed(
+    init_and_plan_context: t.Callable,
+):
+    """This test covers a scenario when a model downstream of a seed model is modified and explicitly selected
+    causing an (unhydrated) seed model to sourced from the state. If SQLMesh attempts to create
+    a table for the unchanged seed model, it will fail because the seed model is not hydrated.
+    """
+    context, _ = init_and_plan_context(
+        "examples/sushi", config="test_config_virtual_environment_mode_dev_only"
+    )
+    context.load()
+    context.plan("prod", auto_apply=True, no_prompts=True)
+
+    # Make sure that a different version of the seed model is loaded
+    seed_model = context.get_model("sushi.waiter_names")
+    seed_model = seed_model.copy(update={"stamp": "force new version"})
+    context.upsert_model(seed_model)
+
+    # Make a change to the downstream model
+    model = context.get_model("sushi.waiter_as_customer_by_day")
+    model = model.copy(update={"stamp": "force new version"})
+    context.upsert_model(model)
+
+    # It is important to clear the cache so that the hydrated seed model is not sourced from the cache
+    context.clear_caches()
+
+    # Make sure to use the selector so that the seed model is sourced from the state
+    plan = context.plan_builder("dev", select_models=[model.name]).build()
+    assert len(plan.directly_modified) == 1
+    assert list(plan.directly_modified)[0].name == model.fqn
+    assert len(plan.missing_intervals) == 1
+    assert plan.missing_intervals[0].snapshot_id.name == model.fqn
+
+    # Make sure there's no error when applying the plan
+    context.apply(plan)
+    context.plan("prod", auto_apply=True, no_prompts=True)
 
 
 @time_machine.travel("2023-01-08 15:00:00 UTC")
@@ -4681,12 +4763,12 @@ def test_plan_repairs_unrenderable_snapshot_state(
         f"name = '{target_snapshot.name}' AND identifier = '{target_snapshot.identifier}'",
     )
 
+    context.clear_caches()
+    target_snapshot_in_state = context.state_sync.get_snapshots([target_snapshot.snapshot_id])[
+        target_snapshot.snapshot_id
+    ]
+
     with pytest.raises(Exception):
-        context_copy = context.copy()
-        context_copy.clear_caches()
-        target_snapshot_in_state = context_copy.state_sync.get_snapshots(
-            [target_snapshot.snapshot_id]
-        )[target_snapshot.snapshot_id]
         target_snapshot_in_state.model.render_query_or_raise()
 
     # Repair the snapshot by creating a new version of it
@@ -4695,11 +4777,11 @@ def test_plan_repairs_unrenderable_snapshot_state(
 
     plan_builder = context.plan_builder("prod", forward_only=forward_only)
     plan = plan_builder.build()
-    assert plan.directly_modified == {target_snapshot.snapshot_id}
     if not forward_only:
         assert target_snapshot.snapshot_id in {i.snapshot_id for i in plan.missing_intervals}
-        plan_builder.set_choice(target_snapshot, SnapshotChangeCategory.NON_BREAKING)
-        plan = plan_builder.build()
+    assert plan.directly_modified == {target_snapshot.snapshot_id}
+    plan_builder.set_choice(target_snapshot, SnapshotChangeCategory.NON_BREAKING)
+    plan = plan_builder.build()
 
     context.apply(plan)
 
@@ -5383,7 +5465,10 @@ def test_auto_categorization(sushi_context: Context):
     ).fingerprint
 
     model = t.cast(SqlModel, sushi_context.get_model("sushi.customers", raise_if_missing=True))
-    sushi_context.upsert_model("sushi.customers", query=model.query.select("'foo' AS foo"))  # type: ignore
+    sushi_context.upsert_model(
+        "sushi.customers",
+        query_=ParsableSql(sql=model.query.select("'foo' AS foo").sql(dialect=model.dialect)),  # type: ignore
+    )
     apply_to_environment(sushi_context, environment)
 
     assert (
@@ -5447,7 +5532,13 @@ def test_multi(mocker):
 
     model = context.get_model("bronze.a")
     assert model.project == "repo_1"
-    context.upsert_model(model.copy(update={"query": model.query.select("'c' AS c")}))
+    context.upsert_model(
+        model.copy(
+            update={
+                "query_": ParsableSql(sql=model.query.select("'c' AS c").sql(dialect=model.dialect))
+            }
+        )
+    )
     plan = context.plan_builder().build()
 
     assert set(snapshot.name for snapshot in plan.directly_modified) == {
@@ -5615,7 +5706,15 @@ def test_multi_virtual_layer(copy_to_temp_path):
 
     model = context.get_model("db_1.first_schema.model_one")
 
-    context.upsert_model(model.copy(update={"query": model.query.select("'c' AS extra")}))
+    context.upsert_model(
+        model.copy(
+            update={
+                "query_": ParsableSql(
+                    sql=model.query.select("'c' AS extra").sql(dialect=model.dialect)
+                )
+            }
+        )
+    )
     plan = context.plan_builder().build()
     context.apply(plan)
 
@@ -5641,9 +5740,25 @@ def test_multi_virtual_layer(copy_to_temp_path):
 
     # Create dev environment with changed models
     model = context.get_model("db_2.second_schema.model_one")
-    context.upsert_model(model.copy(update={"query": model.query.select("'d' AS extra")}))
+    context.upsert_model(
+        model.copy(
+            update={
+                "query_": ParsableSql(
+                    sql=model.query.select("'d' AS extra").sql(dialect=model.dialect)
+                )
+            }
+        )
+    )
     model = context.get_model("first_schema.model_two")
-    context.upsert_model(model.copy(update={"query": model.query.select("'d2' AS col")}))
+    context.upsert_model(
+        model.copy(
+            update={
+                "query_": ParsableSql(
+                    sql=model.query.select("'d2' AS col").sql(dialect=model.dialect)
+                )
+            }
+        )
+    )
     plan = context.plan_builder("dev").build()
     context.apply(plan)
 
@@ -6294,6 +6409,31 @@ def test_restatement_shouldnt_backfill_beyond_prod_intervals(init_and_plan_conte
         ].intervals[-1][1] == to_timestamp("2023-01-08 00:00:00 UTC")
 
 
+@time_machine.travel("2023-01-08 15:00:00 UTC")
+@use_terminal_console
+def test_audit_only_metadata_change(init_and_plan_context: t.Callable):
+    context, plan = init_and_plan_context("examples/sushi")
+    context.apply(plan)
+
+    # Add a new audit
+    model = context.get_model("sushi.waiter_revenue_by_day")
+    audits = model.audits.copy()
+    audits.append(("number_of_rows", {"threshold": exp.Literal.number(1)}))
+    model = model.copy(update={"audits": audits})
+    context.upsert_model(model)
+
+    plan = context.plan_builder("prod", skip_tests=True).build()
+    assert len(plan.new_snapshots) == 2
+    assert all(s.change_category.is_metadata for s in plan.new_snapshots)
+    assert not plan.missing_intervals
+
+    with capture_output() as output:
+        context.apply(plan)
+
+    assert "Auditing models" in output.stdout
+    assert model.name in output.stdout
+
+
 def initial_add(context: Context, environment: str):
     assert not context.state_reader.get_environment(environment)
 
@@ -6605,11 +6745,12 @@ def change_data_type(
     assert model is not None
 
     if isinstance(model, SqlModel):
-        data_types = model.query.find_all(DataType)
+        query = model.query.copy()
+        data_types = query.find_all(DataType)
         for data_type in data_types:
             if data_type.this == old_type:
                 data_type.set("this", new_type)
-        context.upsert_model(model_name, query=model.query)
+        context.upsert_model(model_name, query_=ParsableSql(sql=query.sql(dialect=model.dialect)))
     elif model.columns_to_types_ is not None:
         for k, v in model.columns_to_types_.items():
             if v.this == old_type:
@@ -6896,7 +7037,15 @@ def test_destroy(copy_to_temp_path):
 
     model = context.get_model("db_1.first_schema.model_one")
 
-    context.upsert_model(model.copy(update={"query": model.query.select("'c' AS extra")}))
+    context.upsert_model(
+        model.copy(
+            update={
+                "query_": ParsableSql(
+                    sql=model.query.select("'c' AS extra").sql(dialect=model.dialect)
+                )
+            }
+        )
+    )
     plan = context.plan_builder().build()
     context.apply(plan)
 
@@ -6907,9 +7056,25 @@ def test_destroy(copy_to_temp_path):
 
     # Create dev environment with changed models
     model = context.get_model("db_2.second_schema.model_one")
-    context.upsert_model(model.copy(update={"query": model.query.select("'d' AS extra")}))
+    context.upsert_model(
+        model.copy(
+            update={
+                "query_": ParsableSql(
+                    sql=model.query.select("'d' AS extra").sql(dialect=model.dialect)
+                )
+            }
+        )
+    )
     model = context.get_model("first_schema.model_two")
-    context.upsert_model(model.copy(update={"query": model.query.select("'d2' AS col")}))
+    context.upsert_model(
+        model.copy(
+            update={
+                "query_": ParsableSql(
+                    sql=model.query.select("'d2' AS col").sql(dialect=model.dialect)
+                )
+            }
+        )
+    )
     plan = context.plan_builder("dev").build()
     context.apply(plan)
 
