@@ -587,7 +587,8 @@ class GenericContext(BaseContext, t.Generic[C]):
             self._state_sync = self._new_state_sync()
 
             if self._state_sync.get_versions(validate=False).schema_version == 0:
-                self._state_sync.migrate(default_catalog=self.default_catalog)
+                self.console.log_status_update("Initializing new project state...")
+                self._state_sync.migrate()
             self._state_sync.get_versions()
             self._state_sync = CachingStateSync(self._state_sync)  # type: ignore
         return self._state_sync
@@ -2355,7 +2356,6 @@ class GenericContext(BaseContext, t.Generic[C]):
         self._load_materializations()
         try:
             self._new_state_sync().migrate(
-                default_catalog=self.default_catalog,
                 promoted_snapshots_only=self.config.migration.promoted_snapshots_only,
             )
         except Exception as e:
@@ -3130,7 +3130,9 @@ class GenericContext(BaseContext, t.Generic[C]):
         found_error = False
 
         model_list = (
-            list(self.get_model(model) for model in models) if models else self.models.values()
+            list(self.get_model(model, raise_if_missing=True) for model in models)
+            if models
+            else self.models.values()
         )
         all_violations = []
         for model in model_list:
