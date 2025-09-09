@@ -30,7 +30,7 @@ from sqlmesh.utils.errors import (
     SQLMeshError,
     raise_config_error,
 )
-from sqlmesh.utils.jinja import JinjaMacroRegistry
+from sqlmesh.utils.jinja import JinjaMacroRegistry, extract_error_details
 from sqlmesh.utils.metaprogramming import Executable, prepare_env
 
 if t.TYPE_CHECKING:
@@ -239,17 +239,23 @@ class BaseExpressionRenderer:
                 logger.debug(
                     f"Rendered Jinja expression for model '{self._model_fqn}' at '{self._path}': '{rendered_expression}'"
                 )
-                if rendered_expression.strip():
-                    expressions = [e for e in parse(rendered_expression, read=self._dialect) if e]
-
-                    if not expressions:
-                        raise ConfigError(f"Failed to parse an expression:\n{self._expression}")
             except ParsetimeAdapterCallError:
                 raise
             except Exception as ex:
                 raise ConfigError(
-                    f"Could not render or parse jinja at '{self._path}'.\n{ex}"
+                    f"Could not render jinja for '{self._path}'.\n" + extract_error_details(ex)
                 ) from ex
+
+            if rendered_expression.strip():
+                try:
+                    expressions = [e for e in parse(rendered_expression, read=self._dialect) if e]
+
+                    if not expressions:
+                        raise ConfigError(f"Failed to parse an expression:\n{self._expression}")
+                except Exception as ex:
+                    raise ConfigError(
+                        f"Could not parse the rendered jinja at '{self._path}'.\n{ex}"
+                    ) from ex
 
         if this_model:
             render_kwargs["this_model"] = this_model
