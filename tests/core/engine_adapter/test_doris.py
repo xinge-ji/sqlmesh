@@ -81,7 +81,9 @@ def test_create_materialized_view(make_mocked_engine_adapter: t.Callable[..., Do
         target_columns_to_types={"a": exp.DataType.build("INT"), "b": exp.DataType.build("INT")},
         column_descriptions={"a": "test_column_description", "b": "test_column_description"},
     )
-    adapter.create_view("test_view", parse_one("SELECT a, b FROM tbl"), replace=False, materialized=True)
+    adapter.create_view(
+        "test_view", parse_one("SELECT a, b FROM tbl"), replace=False, materialized=True
+    )
 
     assert to_sql_calls(adapter) == [
         "CREATE MATERIALIZED VIEW `test_view` (`a` COMMENT 'test_column_description', `b` COMMENT 'test_column_description') AS SELECT `a`, `b` FROM `tbl`",
@@ -160,7 +162,9 @@ def test_rename_table(make_mocked_engine_adapter: t.Callable[..., DorisEngineAda
     adapter.cursor.execute.assert_called_once_with("ALTER TABLE `old_table` RENAME `new_table`")
 
 
-def test_replace_by_key(make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture):
+def test_replace_by_key(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter], mocker: MockerFixture
+):
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
     temp_table = parse_one("temp_table")
     mocker.patch.object(adapter, "_get_temp_table", return_value=temp_table)
@@ -174,8 +178,12 @@ def test_replace_by_key(make_mocked_engine_adapter: t.Callable[..., DorisEngineA
 
     adapter._replace_by_key(target_table, source_query, columns_to_types, [exp.column("a")], True)
     adapter._replace_by_key(target_table, source_query, columns_to_types, [exp.column("a")], False)
-    adapter._replace_by_key(target_table, source_query, columns_to_types, [exp.column("a"), exp.column("b")], True)
-    adapter._replace_by_key(target_table, source_query, columns_to_types, [exp.column("a"), exp.column("b")], False)
+    adapter._replace_by_key(
+        target_table, source_query, columns_to_types, [exp.column("a"), exp.column("b")], True
+    )
+    adapter._replace_by_key(
+        target_table, source_query, columns_to_types, [exp.column("a"), exp.column("b")], False
+    )
 
     assert to_sql_calls(adapter, identify=True) == [
         "INSERT INTO `target_table` (`a`, `b`) SELECT `a`, `b` FROM (SELECT `a` AS `a`, `b` AS `b`, ROW_NUMBER() OVER (PARTITION BY `a` ORDER BY `a`) AS _row_number FROM `temp_table`) AS _t WHERE _row_number = 1",
@@ -189,7 +197,9 @@ def test_create_index(make_mocked_engine_adapter: t.Callable[..., DorisEngineAda
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
 
     adapter.create_index("test_table", "test_index", ("cola",))
-    adapter.cursor.execute.assert_called_once_with("CREATE INDEX IF NOT EXISTS `test_index` ON `test_table`(`cola`)")
+    adapter.cursor.execute.assert_called_once_with(
+        "CREATE INDEX IF NOT EXISTS `test_index` ON `test_table`(`cola`)"
+    )
 
 
 def test_create_table_with_distributed_by(
@@ -271,7 +281,11 @@ def test_create_table_with_partitioned_by(
         "test_table",
         target_columns_to_types={"a": exp.DataType.build("INT"), "b": exp.DataType.build("DATE")},
         partitioned_by=[exp.to_column("b")],
-        table_properties={"partitions": exp.Literal.string("FROM ('2000-11-14') TO ('2021-11-14') INTERVAL 2 YEAR")},
+        table_properties={
+            "partitions": exp.Literal.string(
+                "FROM ('2000-11-14') TO ('2021-11-14') INTERVAL 2 YEAR"
+            )
+        },
     )
 
     assert to_sql_calls(adapter) == [

@@ -1797,6 +1797,7 @@ def test_schema_differ_overrides(make_config) -> None:
     assert adapter._schema_differ_overrides == override
     assert adapter.schema_differ.parameterized_type_defaults == {}
 
+
 def test_doris(make_config):
     """Test DorisConnectionConfig basic functionality"""
     # Basic configuration
@@ -1818,7 +1819,7 @@ def test_doris(make_config):
     assert config.database == "demo"
     assert config.DIALECT == "doris"
     assert config.DISPLAY_NAME == "Apache Doris"
-    assert config.DISPLAY_ORDER == 17
+    assert config.DISPLAY_ORDER == 18
     assert config.is_recommended_for_state_sync is False
 
     # Test with minimal configuration (using default port)

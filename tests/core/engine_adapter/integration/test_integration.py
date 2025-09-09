@@ -824,7 +824,7 @@ def test_insert_overwrite_by_time_partition(ctx_query_and_df: TestContext):
         date_3 = (current_date + timedelta(days=2)).strftime("%Y-%m-%d")
         date_4 = (current_date + timedelta(days=3)).strftime("%Y-%m-%d")
         date_5 = (current_date + timedelta(days=4)).strftime("%Y-%m-%d")
-        
+
     ctx.columns_to_types = {"id": "int", "ds": ds_type}
     table = ctx.table("test_table")
     if ctx.dialect == "bigquery":
@@ -933,7 +933,7 @@ def test_insert_overwrite_by_time_partition_source_columns(ctx_query_and_df: Tes
         date_3 = (current_date + timedelta(days=2)).strftime("%Y-%m-%d")
         date_4 = (current_date + timedelta(days=3)).strftime("%Y-%m-%d")
         date_5 = (current_date + timedelta(days=4)).strftime("%Y-%m-%d")
-        
+
     ctx.columns_to_types = {"id": "int", "ds": ds_type}
     columns_to_types = {
         "id": exp.DataType.build("int"),
@@ -1114,7 +1114,9 @@ def test_merge_source_columns(ctx_query_and_df: TestContext):
     columns_to_types = ctx.columns_to_types.copy()
     columns_to_types["ignored_column"] = exp.DataType.build("int")
 
-    ctx.engine_adapter.create_table(table, columns_to_types, table_format=table_format, table_properties=table_properties)
+    ctx.engine_adapter.create_table(
+        table, columns_to_types, table_format=table_format, table_properties=table_properties
+    )
     input_data = pd.DataFrame(
         [
             {"id": 1, "ds": "2022-01-01", "ignored_source": "ignored_value"},
@@ -3843,6 +3845,10 @@ def test_materialized_view_evaluation(ctx: TestContext, mocker: MockerFixture):
         pytest.skip(f"Skipping engine {dialect} as it does not support materialized views")
     elif dialect in ("snowflake", "databricks"):
         pytest.skip(f"Skipping {dialect} as they're not enabled on standard accounts")
+    elif dialect == "doris":
+        pytest.skip(
+            f"Skipping doris as synchronous materialized views do not support specifying schema"
+        )
 
     model_name = ctx.table("test_tbl")
     mview_name = ctx.table("test_mview")
