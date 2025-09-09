@@ -2045,6 +2045,7 @@ def test_dbt_is_incremental_table_is_missing(sushi_test_dbt_context: Context):
     model = context.get_model("sushi.waiter_revenue_by_day_v2")
     model = model.copy(update={"kind": IncrementalUnmanagedKind(), "start": "2023-01-01"})
     context.upsert_model(model)
+    context._standalone_audits["test_top_waiters"].start = "2023-01-01"
 
     context.plan("prod", auto_apply=True, no_prompts=True, skip_tests=True)
 
@@ -6157,7 +6158,6 @@ def test_environment_catalog_mapping(init_and_plan_context: t.Callable):
         {
             "physical.sqlmesh._environments",
             "physical.sqlmesh._intervals",
-            "physical.sqlmesh._plan_dags",
             "physical.sqlmesh._snapshots",
             "physical.sqlmesh._versions",
         }
@@ -6177,7 +6177,6 @@ def test_environment_catalog_mapping(init_and_plan_context: t.Callable):
         {
             "physical.sqlmesh._environments",
             "physical.sqlmesh._intervals",
-            "physical.sqlmesh._plan_dags",
             "physical.sqlmesh._snapshots",
             "physical.sqlmesh._versions",
         }
@@ -6197,7 +6196,6 @@ def test_environment_catalog_mapping(init_and_plan_context: t.Callable):
         {
             "physical.sqlmesh._environments",
             "physical.sqlmesh._intervals",
-            "physical.sqlmesh._plan_dags",
             "physical.sqlmesh._snapshots",
             "physical.sqlmesh._versions",
         }
@@ -6218,7 +6216,6 @@ def test_environment_catalog_mapping(init_and_plan_context: t.Callable):
         {
             "physical.sqlmesh._environments",
             "physical.sqlmesh._intervals",
-            "physical.sqlmesh._plan_dags",
             "physical.sqlmesh._snapshots",
             "physical.sqlmesh._versions",
         }
@@ -6610,7 +6607,6 @@ def test_before_all_after_all_execution_order(tmp_path: Path, mocker: MockerFixt
             "_intervals",
             "_auto_restatements",
             "_environment_statements",
-            "_plan_dags",
         ]
 
         # to ignore the state queries
@@ -7097,7 +7093,6 @@ def test_destroy(copy_to_temp_path):
         "_auto_restatements",
         "_environment_statements",
         "_intervals",
-        "_plan_dags",
         "_versions",
     }
     for table_name in state_tables:

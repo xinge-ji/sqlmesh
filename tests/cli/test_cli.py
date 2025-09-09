@@ -872,7 +872,6 @@ def test_info_on_new_project_does_not_create_state_sync(runner, tmp_path):
     assert not context.engine_adapter.table_exists("sqlmesh._snapshots")
     assert not context.engine_adapter.table_exists("sqlmesh._environments")
     assert not context.engine_adapter.table_exists("sqlmesh._intervals")
-    assert not context.engine_adapter.table_exists("sqlmesh._plan_dags")
     assert not context.engine_adapter.table_exists("sqlmesh._versions")
 
 
@@ -983,6 +982,7 @@ WHERE
         "  rules:\n"
         "    - ambiguousorinvalidcolumn\n"
         "    - invalidselectstarexpansion\n"
+        "    - noambiguousprojections\n"
     )
 
     with open(config_path) as file:
@@ -1049,6 +1049,7 @@ linter:
   rules:
     - ambiguousorinvalidcolumn
     - invalidselectstarexpansion
+    - noambiguousprojections
 """
 
     with open(tmp_path / "config.yaml") as file:
@@ -1991,6 +1992,7 @@ linter:
   rules:
     - ambiguousorinvalidcolumn
     - invalidselectstarexpansion
+    - noambiguousprojections
 """
 
         with open(tmp_path / "config.yaml") as file:
