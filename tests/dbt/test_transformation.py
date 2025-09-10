@@ -45,6 +45,7 @@ from sqlmesh.core.model.kind import (
 from sqlmesh.core.state_sync.db.snapshot import _snapshot_to_json
 from sqlmesh.dbt.builtin import _relation_info_to_relation, Config
 from sqlmesh.dbt.common import Dependencies
+from sqlmesh.dbt.builtin import _relation_info_to_relation
 from sqlmesh.dbt.column import (
     ColumnConfig,
     column_descriptions_to_sqlmesh,
@@ -1435,6 +1436,14 @@ def test_flags(sushi_test_project: Project):
     assert context.render("{{ flags.WHICH }}") == "parse"
 
 
+def test_invocation_args_dict(sushi_test_project: Project):
+    context = sushi_test_project.context
+
+    assert context.render("{{ invocation_args_dict['full_refresh'] }}") == "None"
+    assert context.render("{{ invocation_args_dict['store_failures'] }}") == "None"
+    assert context.render("{{ invocation_args_dict['which'] }}") == "parse"
+
+
 @pytest.mark.xdist_group("dbt_manifest")
 def test_context_namespace(sushi_test_project: Project):
     context = sushi_test_project.context
@@ -2189,7 +2198,7 @@ def test_on_run_start_end():
         runtime_stage=RuntimeStage.BEFORE_ALL,
     )
 
-    rendered_after_all = render_statements(
+    runtime_rendered_after_all = render_statements(
         root_environment_statements.after_all,
         dialect=sushi_context.default_dialect,
         python_env=root_environment_statements.python_env,
@@ -2199,6 +2208,22 @@ def test_on_run_start_end():
         environment_naming_info=EnvironmentNamingInfo(name="dev"),
         engine_adapter=sushi_context.engine_adapter,
     )
+
+    # not passing engine adapter simulates "parse-time" rendering
+    parse_time_rendered_after_all = render_statements(
+        root_environment_statements.after_all,
+        dialect=sushi_context.default_dialect,
+        python_env=root_environment_statements.python_env,
+        jinja_macros=root_environment_statements.jinja_macros,
+        snapshots=sushi_context.snapshots,
+        runtime_stage=RuntimeStage.AFTER_ALL,
+        environment_naming_info=EnvironmentNamingInfo(name="dev"),
+    )
+
+    # validate that the graph_table statement is the same between parse-time and runtime rendering
+    assert sorted(parse_time_rendered_after_all) == sorted(runtime_rendered_after_all)
+    graph_table_stmt = runtime_rendered_after_all[-1]
+    assert graph_table_stmt == parse_time_rendered_after_all[-1]
 
     assert rendered_before_all == [
         "CREATE TABLE IF NOT EXISTS analytic_stats (physical_table TEXT, evaluation_time TEXT)",
@@ -2212,10 +2237,9 @@ def test_on_run_start_end():
         "CREATE OR REPLACE TABLE schema_table_sushi__dev AS SELECT 'sushi__dev' AS schema",
         "DROP TABLE to_be_executed_last",
     ]
-    assert sorted(rendered_after_all[:-1]) == sorted(expected_statements)
+    assert sorted(runtime_rendered_after_all[:-1]) == sorted(expected_statements)
 
     # Assert the models with their materialisations are present in the rendered graph_table statement
-    graph_table_stmt = rendered_after_all[-1]
     assert "'model.sushi.simple_model_a' AS unique_id, 'table' AS materialized" in graph_table_stmt
     assert "'model.sushi.waiters' AS unique_id, 'ephemeral' AS materialized" in graph_table_stmt
     assert "'model.sushi.simple_model_b' AS unique_id, 'table' AS materialized" in graph_table_stmt
@@ -2352,3 +2376,84 @@ def test_dynamic_var_names_in_macro(sushi_test_project: Project):
     )
     converted_model = model_config.to_sqlmesh(context)
     assert "dynamic_test_var" in converted_model.jinja_macros.global_objs["vars"]  # type: ignore
+
+
+def test_selected_resources_with_selectors():
+    sushi_context = Context(paths=["tests/fixtures/dbt/sushi_test"])
+
+    # A plan with a specific model selection
+    plan_builder = sushi_context.plan_builder(select_models=["sushi.customers"])
+    plan = plan_builder.build()
+    assert len(plan.selected_models) == 1
+    selected_model = list(plan.selected_models)[0]
+    assert "customers" in selected_model
+
+    # Plan without model selections should include all models
+    plan_builder = sushi_context.plan_builder()
+    plan = plan_builder.build()
+    assert plan.selected_models is not None
+    assert len(plan.selected_models) > 10
+
+    # with downstream models should select customers and at least one downstream model
+    plan_builder = sushi_context.plan_builder(select_models=["sushi.customers+"])
+    plan = plan_builder.build()
+    assert plan.selected_models is not None
+    assert len(plan.selected_models) >= 2
+    assert any("customers" in model for model in plan.selected_models)
+
+    # Test wildcard selection
+    plan_builder = sushi_context.plan_builder(select_models=["sushi.waiter_*"])
+    plan = plan_builder.build()
+    assert plan.selected_models is not None
+    assert len(plan.selected_models) >= 4
+    assert all("waiter" in model for model in plan.selected_models)
+
+
+@pytest.mark.xdist_group("dbt_manifest")
+def test_selected_resources_context_variable(
+    sushi_test_project: Project, sushi_test_dbt_context: Context
+):
+    context = sushi_test_project.context
+
+    # empty selected resources
+    direct_access = context.render("{{ selected_resources }}")
+    assert direct_access == "[]"
+
+    # selected_resources is iterable and count items
+    test_jinja = """
+    {%- set resources = [] -%}
+    {%- for resource in selected_resources -%}
+        {%- do resources.append(resource) -%}
+    {%- endfor -%}
+    {{ resources | length }}
+    """
+    result = context.render(test_jinja)
+    assert result.strip() == "0"
+
+    # selected_resources in conditions
+    test_condition = """
+    {%- if selected_resources -%}
+        has_resources
+    {%- else -%}
+        no_resources
+    {%- endif -%}
+    """
+    result = context.render(test_condition)
+    assert result.strip() == "no_resources"
+
+    #  selected resources in dbt format
+    selected_resources = [
+        "model.jaffle_shop.customers",
+        "model.jaffle_shop.items",
+        "model.jaffle_shop.orders",
+    ]
+
+    # check the jinja macros rendering
+    result = context.render("{{ selected_resources }}", selected_resources=selected_resources)
+    assert result == selected_resources.__repr__()
+
+    result = context.render(test_jinja, selected_resources=selected_resources)
+    assert result.strip() == "3"
+
+    result = context.render(test_condition, selected_resources=selected_resources)
+    assert result.strip() == "has_resources"

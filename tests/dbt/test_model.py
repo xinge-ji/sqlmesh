@@ -5,9 +5,11 @@ import pytest
 from pathlib import Path
 
 from sqlglot import exp
+from sqlglot.errors import SchemaError
 from sqlmesh import Context
 from sqlmesh.core.model import TimeColumn, IncrementalByTimeRangeKind
 from sqlmesh.core.model.kind import OnDestructiveChange, OnAdditiveChange
+from sqlmesh.core.state_sync.db.snapshot import _snapshot_to_json
 from sqlmesh.dbt.common import Dependencies
 from sqlmesh.dbt.context import DbtContext
 from sqlmesh.dbt.model import ModelConfig
@@ -200,7 +202,7 @@ def test_load_microbatch_all_defined(
             concurrent_batches=true
         )
     }}
-    
+
     SELECT 1 as cola, '2025-01-01' as ds
     """
     microbatch_model_file = model_dir / "microbatch.sql"
@@ -327,7 +329,8 @@ def test_load_incremental_time_range_strategy_required_only(
 
     snapshot_fqn = '"local"."main"."incremental_time_range"'
     context = Context(paths=project_dir)
-    model = context.snapshots[snapshot_fqn].model
+    snapshot = context.snapshots[snapshot_fqn]
+    model = snapshot.model
     # Validate model-level attributes
     assert model.start == "2025-01-01"
     assert model.interval_unit.is_day
@@ -341,6 +344,8 @@ def test_load_incremental_time_range_strategy_required_only(
     assert model.depends_on_self is False
     assert model.kind.auto_restatement_intervals is None
     assert model.kind.partition_by_time_column is True
+    # make sure the snapshot can be serialized to json
+    assert isinstance(_snapshot_to_json(snapshot), str)
 
 
 @pytest.mark.slow
@@ -380,7 +385,8 @@ def test_load_incremental_time_range_strategy_all_defined(
 
     snapshot_fqn = '"local"."main"."incremental_time_range"'
     context = Context(paths=project_dir)
-    model = context.snapshots[snapshot_fqn].model
+    snapshot = context.snapshots[snapshot_fqn]
+    model = snapshot.model
     # Validate model-level attributes
     assert model.start == "2025-01-01"
     assert model.interval_unit.is_day
@@ -401,6 +407,8 @@ def test_load_incremental_time_range_strategy_all_defined(
     assert model.kind.batch_size == 3
     assert model.kind.batch_concurrency == 2
     assert model.depends_on_self is False
+    # make sure the snapshot can be serialized to json
+    assert isinstance(_snapshot_to_json(snapshot), str)
 
 
 @pytest.mark.slow
@@ -579,3 +587,133 @@ def test_load_microbatch_with_ref_no_filter(
         context.render(microbatch_two_snapshot_fqn, start="2025-01-01", end="2025-01-10").sql()
         == 'SELECT "microbatch"."cola" AS "cola", "microbatch"."ds" AS "ds" FROM "local"."main"."microbatch" AS "microbatch"'
     )
+
+
+@pytest.mark.slow
+def test_dbt_jinja_macro_undefined_variable_error(create_empty_project):
+    project_dir, model_dir = create_empty_project()
+
+    dbt_profile_config = {
+        "test": {
+            "outputs": {
+                "duckdb": {
+                    "type": "duckdb",
+                    "path": str(project_dir.parent / "dbt_data" / "main.db"),
+                }
+            },
+            "target": "duckdb",
+        }
+    }
+    db_profile_file = project_dir / "profiles.yml"
+    with open(db_profile_file, "w", encoding="utf-8") as f:
+        YAML().dump(dbt_profile_config, f)
+
+    macros_dir = project_dir / "macros"
+    macros_dir.mkdir()
+
+    # the execute guard in the macro is so that dbt won't fail on the manifest loading earlier
+    macro_file = macros_dir / "my_macro.sql"
+    macro_file.write_text("""
+{%- macro select_columns(table_name) -%}
+  {% if execute %}
+    {%- if target.name == 'production' -%}
+        {%- set columns = run_query('SELECT column_name FROM information_schema.columns WHERE table_name = \'' ~ table_name ~ '\'') -%}
+    {%- endif -%}
+    SELECT {{ columns.rows[0][0] }} FROM {{ table_name }}
+  {%- endif -%}
+{%- endmacro -%}
+""")
+
+    model_file = model_dir / "my_model.sql"
+    model_file.write_text("""
+{{ config(
+    materialized='table'
+) }}
+
+{{ select_columns('users') }}
+""")
+
+    with pytest.raises(SchemaError) as exc_info:
+        Context(paths=project_dir)
+
+    error_message = str(exc_info.value)
+    assert "Failed to update model schemas" in error_message
+    assert "Could not render jinja for" in error_message
+    assert "Undefined macro/variable: 'columns' in macro: 'select_columns'" in error_message
+
+
+@pytest.mark.slow
+def test_node_name_populated_for_dbt_models(dbt_dummy_postgres_config: PostgresConfig) -> None:
+    model_config = ModelConfig(
+        name="test_model",
+        package_name="test_package",
+        sql="SELECT 1 as id",
+        database="test_db",
+        schema_="test_schema",
+        alias="test_model",
+    )
+
+    context = DbtContext()
+    context.project_name = "test_project"
+    context.target = dbt_dummy_postgres_config
+
+    # check after convert to SQLMesh model that node_name is populated correctly
+    sqlmesh_model = model_config.to_sqlmesh(context)
+    assert sqlmesh_model.dbt_name == "model.test_package.test_model"
+
+
+@pytest.mark.slow
+def test_load_model_dbt_node_name(tmp_path: Path) -> None:
+    yaml = YAML()
+    dbt_project_dir = tmp_path / "dbt"
+    dbt_project_dir.mkdir()
+    dbt_model_dir = dbt_project_dir / "models"
+    dbt_model_dir.mkdir()
+
+    model_contents = "SELECT 1 as id, 'test' as name"
+    model_file = dbt_model_dir / "simple_model.sql"
+    with open(model_file, "w", encoding="utf-8") as f:
+        f.write(model_contents)
+
+    dbt_project_config = {
+        "name": "test_project",
+        "version": "1.0.0",
+        "config-version": 2,
+        "profile": "test",
+        "model-paths": ["models"],
+    }
+    dbt_project_file = dbt_project_dir / "dbt_project.yml"
+    with open(dbt_project_file, "w", encoding="utf-8") as f:
+        yaml.dump(dbt_project_config, f)
+
+    sqlmesh_config = {
+        "model_defaults": {
+            "start": "2025-01-01",
+        }
+    }
+    sqlmesh_config_file = dbt_project_dir / "sqlmesh.yaml"
+    with open(sqlmesh_config_file, "w", encoding="utf-8") as f:
+        yaml.dump(sqlmesh_config, f)
+
+    dbt_data_dir = tmp_path / "dbt_data"
+    dbt_data_dir.mkdir()
+    dbt_data_file = dbt_data_dir / "local.db"
+    dbt_profile_config = {
+        "test": {
+            "outputs": {"duckdb": {"type": "duckdb", "path": str(dbt_data_file)}},
+            "target": "duckdb",
+        }
+    }
+    db_profile_file = dbt_project_dir / "profiles.yml"
+    with open(db_profile_file, "w", encoding="utf-8") as f:
+        yaml.dump(dbt_profile_config, f)
+
+    context = Context(paths=dbt_project_dir)
+
+    # find the model by its sqlmesh fully qualified name
+    model_fqn = '"local"."main"."simple_model"'
+    assert model_fqn in context.snapshots
+
+    # Verify that node_name is the equivalent dbt one
+    model = context.snapshots[model_fqn].model
+    assert model.dbt_name == "model.test_project.simple_model"
