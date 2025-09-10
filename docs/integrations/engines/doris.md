@@ -87,7 +87,7 @@ MODEL (
 
 ## Table Properties
 
-The Doris adapter supports a comprehensive set of table properties that can be configured in the `physical_properties` section of your model. These properties are processed by the `_build_table_properties_exp` method.
+The Doris adapter supports a comprehensive set of table properties that can be configured in the `physical_properties` section of your model.
 
 ### Core Table Properties
 
@@ -96,7 +96,7 @@ The Doris adapter supports a comprehensive set of table properties that can be c
 | `unique_key`          | `Tuple[str]` or `str` | Defines unique key columns for UNIQUE model | `('user_id')` or `'user_id'`                               |
 | `duplicate_key`       | `Tuple[str]` or `str` | Defines key columns for DUPLICATE model     | `（'user_id', 'event_time'）`                              |
 | `distributed_by`      | `Dict`                | Distribution configuration                  | See Distribution section                                   |
-| `partitioned_by_expr` | `Tuple[str]` or `str` | Custom partition expression                 | `'FROM ("2000-11-14") TO ("2099-11-14") INTERVAL 1 MONTH'` |
+| `partitions`          | `Tuple[str]` or `str` | Custom partition expression                 | `'FROM ("2000-11-14") TO ("2099-11-14") INTERVAL 1 MONTH'` |
 
 ### Distribution Configuration
 
@@ -139,16 +139,16 @@ MODEL (
 
 ### Partitioning
 
-Doris supports range partitioning to improve query performance. SQLMesh automatically translates partitioning into Doris's `PARTITION BY RANGE` syntax.
+Doris supports range partitioning and list partitioning to improve query performance.
 
 **Custom Partition Expression:**
 ```sql
 MODEL (
   name my_partitioned_model,
   kind INCREMENTAL_BY_TIME_RANGE(time_column (event_date, '%Y-%m-%d')),
-  partitioned_by event_date
+  partitioned_by RANGE(event_date),
   physical_properties (
-    partitioned_by_expr = 'FROM ("2000-11-14") TO ("2099-11-14") INTERVAL 2 YEAR',
+    partitions = 'FROM ("2000-11-14") TO ("2099-11-14") INTERVAL 2 YEAR',
   ),
 );
 ```
@@ -157,7 +157,7 @@ MODEL (
 MODEL (
   name my_custom_partitioned_model,
   kind FULL,
-  partitioned_by event_date,
+  partitioned_by RANGE(event_date),
   physical_properties (
     partitioned_by_expr = (
       'PARTITION `p2023` VALUES [("2023-01-01"), ("2024-01-01"))', 
@@ -168,11 +168,6 @@ MODEL (
   )
 );
 ```
-
-**Important Notes:**
-- For UNIQUE KEY tables, partition columns must be included in the `unique_key` definition
-- If partition columns are not in the unique key, partitioning will be skipped with a warning
-- The adapter automatically handles partition expression generation for time-based partitioning
 
 ### Generic Properties
 
@@ -261,7 +256,6 @@ MODEL (
 | `refresh_trigger`     | Schedule for automatic refresh                                                  | `'MANUAL'`, `'ON SCHEDULE INTERVAL 1 HOUR'`, `'ON COMMIT'` |
 | `unique_key`          | Unique key columns                                                              | `'user_id'` or `['user_id', 'date']`                       |
 | `duplicate_key`       | Duplicate key columns                                                           | `'user_id'` or `['user_id', 'date']`                       |
-| `partitioned_by_expr` | Custom partition expression. Applies only if `partitioned_by` is not specified. | `'date_trunc(event_date, "month")'`                        |
 | `materialized_type`   | Materialized type                                                               | `SYNC`, `ASYNC`                                            |
 | `source_table`        | Source table of synchronous materialized view                                   | `schema_name`.`table_name`                                 |
 
@@ -332,12 +326,6 @@ SELECT
 FROM user_events
 GROUP BY user_id;
 ```
-
-### View Limitations
-
-- `CREATE OR REPLACE VIEW` is not supported. If `replace=True`, SQLMesh will drop the view first and then create it
-- The `CASCADE` clause is not supported for dropping views
-- Materialized views support all Doris-specific properties and optimizations
 
 ## Schema Management
 
