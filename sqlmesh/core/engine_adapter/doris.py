@@ -54,8 +54,6 @@ class DorisEngineAdapter(
     SUPPORTS_MATERIALIZED_VIEW_SCHEMA = True
     SUPPORTS_CREATE_DROP_CATALOG = False
     INSERT_OVERWRITE_STRATEGY = InsertOverwriteStrategy.DELETE_INSERT
-    # default setting `enable_unicode_name_support=false` so it is incompatible with unicode characters in model names
-    QUOTE_IDENTIFIERS_IN_VIEWS = False
 
     def create_schema(
         self,

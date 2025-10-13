@@ -4086,6 +4086,11 @@ def test_unicode_characters(ctx: TestContext, tmp_path: Path):
     # I also think Spark may not support unicode in general but that would need to be verified.
     if not ctx.engine_adapter.QUOTE_IDENTIFIERS_IN_VIEWS:
         pytest.skip("Skipping as these engines have issues with unicode characters in model names")
+    # Doris default setting `enable_unicode_name_support=false` so it is incompatible with unicode characters in model names
+    if ctx.dialect == "doris":
+        pytest.skip(
+            "Skipping as Doris default setting has issues with unicode characters in model names"
+        )
 
     model_name = "客户数据"
     table = ctx.table(model_name).sql(dialect=ctx.dialect)
