@@ -128,6 +128,7 @@ from sqlmesh.utils.date import (
     now,
     to_datetime,
     make_exclusive,
+    set_timezone,
 )
 from sqlmesh.utils.errors import (
     CircuitBreakerError,
@@ -456,12 +457,20 @@ class GenericContext(BaseContext, t.Generic[C]):
         self.users = list({user.username: user for user in self.users}.values())
         self._register_notification_targets()
 
+        # Set the timezone context for this gateway so all date operations use it
+        set_timezone(self.gateway_timezone)
+
         if load:
             self.load()
 
     @property
     def default_dialect(self) -> t.Optional[str]:
         return self.config.dialect
+
+    @property
+    def gateway_timezone(self) -> t.Optional[str]:
+        """Returns the timezone for the selected gateway."""
+        return self.config.get_timezone(self.selected_gateway)
 
     @property
     def engine_adapter(self) -> EngineAdapter:

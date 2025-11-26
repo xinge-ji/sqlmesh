@@ -347,6 +347,17 @@ class Config(BaseConfig):
     def get_scheduler(self, gateway_name: t.Optional[str] = None) -> SchedulerConfig:
         return self.get_gateway(gateway_name).scheduler or self.default_scheduler
 
+    def get_timezone(self, gateway_name: t.Optional[str] = None) -> t.Optional[str]:
+        """Get the timezone for a specific gateway.
+        
+        Args:
+            gateway_name: The name of the gateway. If None, uses the default gateway.
+            
+        Returns:
+            The timezone string for the gateway, or None if not configured (defaults to UTC in usage).
+        """
+        return self.get_gateway(gateway_name).timezone
+
     def get_state_schema(self, gateway_name: t.Optional[str] = None) -> t.Optional[str]:
         return self.get_gateway(gateway_name).state_schema
 

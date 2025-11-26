@@ -4,6 +4,7 @@ import re
 import time
 import typing as t
 import warnings
+from contextvars import ContextVar
 
 from datetime import date, datetime, timedelta, timezone, tzinfo
 
@@ -24,6 +25,31 @@ TimeLike = t.Union[date, datetime, str, int, float]
 DatetimeRange = t.Tuple[datetime, datetime]
 DatetimeRanges = t.List[DatetimeRange]
 DATE_INT_FMT = "%Y%m%d"
+
+# Context variable to store the current timezone for the running context
+# This allows all date functions to be timezone-aware without passing tz through every call
+_current_timezone: ContextVar[t.Optional[str]] = ContextVar("_current_timezone", default=None)
+
+
+def set_timezone(tz: t.Optional[str]) -> None:
+    """Set the timezone for the current context.
+    
+    This timezone will be used by all date/time functions in this context
+    unless explicitly overridden.
+    
+    Args:
+        tz: The timezone name (e.g., 'America/New_York') or None for UTC.
+    """
+    _current_timezone.set(tz)
+
+
+def get_timezone() -> t.Optional[str]:
+    """Get the currently configured timezone for this context.
+    
+    Returns:
+        The timezone name or None if using UTC.
+    """
+    return _current_timezone.get()
 
 
 warnings.filterwarnings(
@@ -46,45 +72,70 @@ TEMPORAL_TZ_TYPES = {
 }
 
 
-def now(minute_floor: bool = True) -> datetime:
+def now(minute_floor: bool = True, tz: t.Optional[t.Union[str, tzinfo]] = None) -> datetime:
     """
-    Current utc datetime with optional minute level accuracy / granularity.
+    Current datetime with optional minute level accuracy / granularity.
 
     minute_floor is set to True by default
 
     Args:
         minute_floor: If true (default), removes the second and microseconds from the current datetime.
+        tz: The timezone to use. Can be a timezone name string (e.g., 'America/New_York') or a tzinfo object.
+            If None, uses the context timezone (set via set_timezone()), or UTC if no context timezone is set.
 
     Returns:
-        A datetime object with tz utc.
+        A datetime object with the specified timezone (or context/UTC if not provided).
     """
-    now = datetime.now(tz=UTC)
+    import zoneinfo
+    
+    # If no timezone is explicitly provided, use the context timezone
+    if tz is None:
+        tz = get_timezone()
+    
+    if tz is None:
+        target_tz = UTC
+    elif isinstance(tz, str):
+        try:
+            target_tz = zoneinfo.ZoneInfo(tz)
+        except Exception:
+            # Fallback to UTC if invalid timezone string
+            target_tz = UTC
+    else:
+        target_tz = tz
+    
+    now_dt = datetime.now(tz=target_tz)
     if minute_floor:
-        return now.replace(second=0, microsecond=0, tzinfo=UTC)
-    return now.replace(tzinfo=UTC)
+        return now_dt.replace(second=0, microsecond=0)
+    return now_dt
 
 
-def now_timestamp(minute_floor: bool = False) -> int:
+def now_timestamp(minute_floor: bool = False, tz: t.Optional[t.Union[str, tzinfo]] = None) -> int:
     """
-    Current utc timestamp.
+    Current timestamp.
 
     Args:
         minute_floor: If true, removes the second and microseconds from the current datetime.
+        tz: The timezone to use. Can be a timezone name string or a tzinfo object.
+            If None, defaults to UTC.
 
     Returns:
-        UTC epoch millis timestamp
+        Epoch millis timestamp
     """
-    return to_timestamp(now(minute_floor))
+    return to_timestamp(now(minute_floor, tz=tz))
 
 
-def now_ds() -> str:
+def now_ds(tz: t.Optional[t.Union[str, tzinfo]] = None) -> str:
     """
-    Current utc ds.
+    Current ds string.
+
+    Args:
+        tz: The timezone to use. Can be a timezone name string or a tzinfo object.
+            If None, defaults to UTC.
 
     Returns:
         Today's ds string.
     """
-    return to_ds(now())
+    return to_ds(now(tz=tz))
 
 
 def yesterday(relative_base: t.Optional[datetime] = None) -> datetime:

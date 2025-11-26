@@ -189,6 +189,7 @@ NOTE: Spark and Trino engines may not be used for the state connection.
 | `test_connection`  | The data warehouse connection SQLMesh will use to execute tests. (Default: `connection`)                                                                                        | [connection configuration](#connection)                      | N                                                                      |
 | `scheduler`        | The scheduler SQLMesh will use to execute tests. (Default: `builtin`)                                                                                                           | [scheduler configuration](#scheduler)                        | N                                                                      |
 | `variables`        | The gateway-specific variables which override the root-level [variables](#variables) by key.                                                                                    | dict[string, int \| float \| bool \| string \| list \| dict] | N                                                                      |
+| `timezone`         | The timezone for this gateway. All time/date operations in SQLMesh will use this timezone. Can be any valid IANA timezone name (e.g., 'America/New_York', 'Europe/London'). If not specified, defaults to UTC. | string | N |
 
 ### Connection
 

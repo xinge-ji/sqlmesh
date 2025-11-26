@@ -1,0 +1,57 @@
+# Example SQLMesh configuration demonstrating gateway timezone usage
+#
+# This example shows how to configure gateways with different timezones.
+# When you specify a timezone for a gateway, all time/date operations
+# in SQLMesh (scheduling, execution timestamps, etc.) will use that timezone.
+
+gateways:
+  # Gateway for US East Coast operations
+  us_east:
+    timezone: America/New_York
+    connection:
+      type: duckdb
+      database: us_east.db
+    
+  # Gateway for US West Coast operations
+  us_west:
+    timezone: America/Los_Angeles
+    connection:
+      type: duckdb
+      database: us_west.db
+  
+  # Gateway for European operations
+  europe:
+    timezone: Europe/London
+    connection:
+      type: duckdb
+      database: europe.db
+  
+  # Gateway with no timezone specified (defaults to UTC)
+  global:
+    connection:
+      type: duckdb
+      database: global.db
+
+# Set the default gateway
+default_gateway: us_east
+
+# Model defaults
+model_defaults:
+  dialect: duckdb
+
+# Important Note:
+# The gateway timezone affects ALL time/date operations in SQLMesh:
+# - When jobs are scheduled to run
+# - The values of @start_ds, @end_ds, @start_ts, @end_ts in your models
+# - How "yesterday", "today", etc. are interpreted
+# - Time ranges used for incremental model backfills
+#
+# This means you can keep your data in the gateway timezone - you don't need
+# to convert everything to UTC. For example:
+#
+# If gateway timezone is America/New_York:
+# - @start_ds represents the date in NY time, not UTC
+# - Your time_column can store NY timestamps
+# - "yesterday" means yesterday in NY, not UTC
+# - Jobs scheduled for 9am run at 9am NY time
+

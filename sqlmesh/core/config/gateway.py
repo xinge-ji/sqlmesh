@@ -27,6 +27,8 @@ class GatewayConfig(BaseConfig):
             then no schema name is used and therefore the default schema defined for the connection will be used
         variables: A dictionary of gateway-specific variables that can be used in models / macros. This overrides
             root-level variables by key.
+        timezone: The timezone for this gateway. All time/date operations in SQLMesh will use this timezone.
+            If not specified, defaults to UTC. Can be any valid IANA timezone name (e.g., 'America/New_York', 'Europe/London').
     """
 
     connection: t.Optional[SerializableConnectionConfig] = None
@@ -36,6 +38,7 @@ class GatewayConfig(BaseConfig):
     state_schema: t.Optional[str] = c.SQLMESH
     variables: t.Dict[str, t.Any] = {}
     model_defaults: t.Optional[ModelDefaultsConfig] = None
+    timezone: t.Optional[str] = None
 
     _connection_config_validator = connection_config_validator
     _scheduler_config_validator = scheduler_config_validator

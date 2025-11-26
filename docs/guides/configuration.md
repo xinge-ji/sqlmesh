@@ -810,13 +810,35 @@ The `gateways` configuration defines how SQLMesh should connect to the data ware
 
 Each gateway key represents a unique gateway name and configures its connections. **Gateway names are case-insensitive** - SQLMesh automatically normalizes gateway names to lowercase during configuration validation. This means you can use any case in your configuration files (e.g., `MyGateway`, `mygateway`, `MYGATEWAY`) and they will all work correctly.
 
-For example, this configures the `my_gateway` gateway:
+#### Gateway Timezone
+
+Each gateway can specify a timezone that will be used for all time/date operations in SQLMesh when working with that gateway. This allows you to work with data in your local timezone without having to convert everything to UTC.
+
+The timezone should be specified using IANA timezone names (e.g., 'America/New_York', 'Europe/London', 'Asia/Tokyo'). If not specified, all operations default to UTC.
+
+**What the gateway timezone affects:**
+
+- **Job scheduling**: When jobs are scheduled to run
+- **Time ranges in queries**: The values of `@start_ds`, `@end_ds`, `@start_ts`, `@end_ts`, etc. in your models
+- **Relative time expressions**: How "yesterday", "today", "1 week ago" are interpreted
+- **Data filtering**: Time ranges used for incremental model backfills and updates
+
+This means you can keep your data in your local timezone and use time columns in that timezone - you don't need to convert to UTC. SQLMesh will handle all time operations in the gateway's configured timezone.
+
+For example, if you configure a gateway with `timezone: America/New_York`:
+- A job scheduled for "9am" runs at 9am New York time
+- `@start_ds` and `@end_ds` represent dates in New York time
+- Your model's `time_column` can store timestamps in New York time
+- "yesterday" means yesterday in New York, not UTC
+
+For example, this configures the `my_gateway` gateway with timezone:
 
 === "YAML"
 
     ```yaml linenums="1"
     gateways:
       my_gateway:
+        timezone: America/New_York
         connection:
           ...
         state_connection:
@@ -844,6 +866,7 @@ For example, this configures the `my_gateway` gateway:
         model_defaults=ModelDefaultsConfig(dialect=<dialect>),
         gateways={
             "my_gateway": GatewayConfig(
+                timezone="America/New_York",
                 connection=...,
                 state_connection=...,
                 test_connection=...,
