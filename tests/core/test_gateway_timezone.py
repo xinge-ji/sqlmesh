@@ -1,9 +1,11 @@
 """Tests for gateway timezone configuration."""
 import pytest
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from sqlmesh.core.config import Config, GatewayConfig, DuckDBConnectionConfig
 from sqlmesh.core.context import Context
-from sqlmesh.utils.date import now, set_timezone, get_timezone, yesterday, yesterday_ds
+from sqlmesh.utils.concurrency import concurrent_apply_to_values
+from sqlmesh.utils.cron import CroniterCache
+from sqlmesh.utils.date import date_dict, now, set_timezone, get_timezone, yesterday, yesterday_ds
 from tempfile import TemporaryDirectory
 from pathlib import Path
 
@@ -59,6 +61,7 @@ def test_now_with_timezone():
 
 def test_context_gateway_timezone():
     """Test that Context correctly exposes gateway timezone."""
+    original_tz = get_timezone()
     with TemporaryDirectory() as tmpdir:
         # Create a simple model file
         models_dir = Path(tmpdir) / "models"
@@ -87,6 +90,8 @@ SELECT 1 as id
         context = Context(paths=tmpdir, config=config, load=True)
         
         assert context.gateway_timezone == "America/Los_Angeles"
+        assert get_timezone() == "America/Los_Angeles"
+    set_timezone(original_tz)
 
 
 def test_invalid_timezone_fallback():
@@ -178,3 +183,49 @@ def test_all_date_functions_use_context_timezone():
     finally:
         set_timezone(original_tz)
 
+
+def test_date_dict_respects_context_timezone():
+    original_tz = get_timezone()
+
+    try:
+        set_timezone("America/Los_Angeles")
+
+        # 2024-01-01 00:30 UTC is still 2023-12-31 in Los Angeles.
+        execution_time = datetime(2024, 1, 1, 0, 30, tzinfo=timezone.utc)
+        variables = date_dict(execution_time=execution_time, start=None, end=None)
+
+        assert variables["execution_ds"] == "2023-12-31"
+        assert variables["execution_date"] == date(2023, 12, 31)
+        assert variables["execution_dt"].tzinfo.key == "America/Los_Angeles"
+    finally:
+        set_timezone(original_tz)
+
+
+def test_croniter_cache_respects_context_timezone():
+    original_tz = get_timezone()
+
+    try:
+        set_timezone("America/Los_Angeles")
+
+        base_time = datetime(2024, 1, 1, 1, 0, tzinfo=timezone.utc)  # 2023-12-31 17:00 in LA
+        cron = CroniterCache("0 0 * * *", time=base_time)
+        next_run = cron.get_next()
+
+        assert next_run.tzinfo.key == "America/Los_Angeles"
+        assert next_run.hour == 0
+        assert next_run.minute == 0
+        assert next_run.date() == date(2024, 1, 1)
+    finally:
+        set_timezone(original_tz)
+
+
+def test_timezone_propagates_to_threadpool():
+    original_tz = get_timezone()
+
+    try:
+        set_timezone("Europe/Paris")
+
+        results = concurrent_apply_to_values([1, 2, 3], lambda _: get_timezone(), tasks_num=3)
+        assert results == ["Europe/Paris", "Europe/Paris", "Europe/Paris"]
+    finally:
+        set_timezone(original_tz)

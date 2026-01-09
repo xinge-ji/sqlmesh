@@ -352,14 +352,24 @@ def _parse_select(
     consume_pipe: bool = True,
     from_: t.Optional[exp.From] = None,
 ) -> t.Optional[exp.Expression]:
-    select = self.__parse_select(  # type: ignore
-        nested=nested,
-        table=table,
-        parse_subquery_alias=parse_subquery_alias,
-        parse_set_operation=parse_set_operation,
-        consume_pipe=consume_pipe,
-        from_=from_,
-    )
+    try:
+        select = self.__parse_select(  # type: ignore
+            nested=nested,
+            table=table,
+            parse_subquery_alias=parse_subquery_alias,
+            parse_set_operation=parse_set_operation,
+            consume_pipe=consume_pipe,
+            from_=from_,
+        )
+    except TypeError:
+        # Backwards-compatibility for older sqlglot versions where `from_` isn't supported.
+        select = self.__parse_select(  # type: ignore
+            nested=nested,
+            table=table,
+            parse_subquery_alias=parse_subquery_alias,
+            parse_set_operation=parse_set_operation,
+            consume_pipe=consume_pipe,
+        )
 
     if (
         not select

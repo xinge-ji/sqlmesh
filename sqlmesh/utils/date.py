@@ -7,6 +7,7 @@ import warnings
 from contextvars import ContextVar
 
 from datetime import date, datetime, timedelta, timezone, tzinfo
+import zoneinfo
 
 import dateparser
 from dateparser import freshness_date_parser as freshness_date_parser_module
@@ -52,6 +53,32 @@ def get_timezone() -> t.Optional[str]:
     return _current_timezone.get()
 
 
+def _timezone_info(tz_name: t.Optional[str]) -> tzinfo:
+    if not tz_name:
+        return UTC
+    try:
+        return zoneinfo.ZoneInfo(tz_name)
+    except Exception:
+        return UTC
+
+
+def _default_timezone() -> tzinfo:
+    return _timezone_info(get_timezone())
+
+
+def _tz_name(tz: tzinfo) -> str:
+    if tz == UTC:
+        return "UTC"
+    key = getattr(tz, "key", None)
+    return key if isinstance(key, str) and key else "UTC"
+
+
+def _as_timezone(dt: datetime, tz: tzinfo) -> datetime:
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=tz)
+    return dt.astimezone(tz)
+
+
 warnings.filterwarnings(
     "ignore",
     message="The localize method is no longer necessary, as this time zone supports the fold attribute",
@@ -86,23 +113,14 @@ def now(minute_floor: bool = True, tz: t.Optional[t.Union[str, tzinfo]] = None) 
     Returns:
         A datetime object with the specified timezone (or context/UTC if not provided).
     """
-    import zoneinfo
-    
     # If no timezone is explicitly provided, use the context timezone
     if tz is None:
-        tz = get_timezone()
-    
-    if tz is None:
-        target_tz = UTC
+        target_tz = _default_timezone()
     elif isinstance(tz, str):
-        try:
-            target_tz = zoneinfo.ZoneInfo(tz)
-        except Exception:
-            # Fallback to UTC if invalid timezone string
-            target_tz = UTC
+        target_tz = _timezone_info(tz)
     else:
         target_tz = tz
-    
+
     now_dt = datetime.now(tz=target_tz)
     if minute_floor:
         return now_dt.replace(second=0, microsecond=0)
@@ -140,17 +158,17 @@ def now_ds(tz: t.Optional[t.Union[str, tzinfo]] = None) -> str:
 
 def yesterday(relative_base: t.Optional[datetime] = None) -> datetime:
     """
-    Yesterday utc datetime.
+    Yesterday datetime.
 
     Returns:
-        A datetime object with tz utc representing yesterday's date
+        A timezone-aware datetime representing yesterday's date.
     """
     return to_datetime("yesterday", relative_base=relative_base)
 
 
 def yesterday_ds(relative_base: t.Optional[datetime] = None) -> str:
     """
-    Yesterday utc ds.
+    Yesterday ds.
 
     Returns:
         Yesterday's ds string.
@@ -160,10 +178,10 @@ def yesterday_ds(relative_base: t.Optional[datetime] = None) -> str:
 
 def yesterday_timestamp(relative_base: t.Optional[datetime] = None) -> int:
     """
-    Yesterday utc timestamp.
+    Yesterday timestamp.
 
     Returns:
-        UTC epoch millis timestamp of yesterday
+        Epoch millis timestamp of yesterday.
     """
     return to_timestamp(yesterday(relative_base=relative_base))
 
@@ -194,27 +212,44 @@ def to_timestamp(
     )
 
 
-@ttl_cache()
 def to_datetime(
     value: TimeLike,
     relative_base: t.Optional[datetime] = None,
     check_categorical_relative_expression: bool = True,
     tz: t.Optional[tzinfo] = None,
 ) -> datetime:
-    """Converts a value into a UTC datetime object.
+    """Converts a value into a timezone-aware datetime object.
 
     Args:
         value: A variety of date formats. If the value is number-like, it is assumed to be millisecond epochs.
         relative_base: The datetime to reference for time expressions that are using relative terms.
         check_categorical_relative_expression: If True, takes into account the relative expressions that are categorical.
-        tz: Timezone to convert datetime to, defaults to utc
+        tz: Timezone to convert datetime to. If not provided, defaults to the current context timezone (or UTC).
 
     Raises:
         ValueError if value cannot be converted to a datetime.
 
     Returns:
-        A datetime object with tz (default UTC).
+        A datetime object with tz (default: context timezone / UTC).
     """
+    target_tz = tz or _default_timezone()
+    return _to_datetime(
+        value,
+        relative_base=relative_base,
+        check_categorical_relative_expression=check_categorical_relative_expression,
+        tz=target_tz,
+    )
+
+
+@ttl_cache()
+def _to_datetime(
+    value: TimeLike,
+    relative_base: t.Optional[datetime] = None,
+    check_categorical_relative_expression: bool = True,
+    tz: tzinfo = UTC,
+) -> datetime:
+    target_tz = tz
+    tz_name = _tz_name(target_tz)
     if isinstance(value, datetime):
         dt: t.Optional[datetime] = value
     elif isinstance(value, date):
@@ -228,37 +263,38 @@ def to_datetime(
             epoch = None
 
         if epoch is None:
-            relative_base = relative_base or now()
+            relative_base_dt = relative_base or now(minute_floor=False, tz=target_tz)
+            relative_base_dt = _as_timezone(relative_base_dt, target_tz)
             expression = str(value)
             if check_categorical_relative_expression and is_categorical_relative_expression(
                 expression
             ):
-                relative_base = relative_base.replace(hour=0, minute=0, second=0, microsecond=0)
+                relative_base_dt = relative_base_dt.replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
 
-            # note: we hardcode TIMEZONE: UTC to work around this bug: https://github.com/scrapinghub/dateparser/issues/896
+            # note: we set TIMEZONE explicitly to work around this bug: https://github.com/scrapinghub/dateparser/issues/896
             # where dateparser just silently fails if it cant interpret the contents of /etc/localtime
-            # this works because SQLMesh only deals with UTC, there is no concept of user local time
+            # we avoid relying on system timezone by always setting an explicit IANA timezone (or UTC).
             dt = dateparser.parse(
-                expression, settings={"RELATIVE_BASE": relative_base, "TIMEZONE": "UTC"}
+                expression, settings={"RELATIVE_BASE": relative_base_dt, "TIMEZONE": tz_name}
             )
         else:
             try:
                 dt = datetime.strptime(str(value), DATE_INT_FMT)
             except ValueError:
-                dt = datetime.fromtimestamp(epoch / 1000.0, tz=UTC)
+                dt = datetime.fromtimestamp(epoch / 1000.0, tz=UTC).astimezone(target_tz)
 
     if dt is None:
         raise ValueError(f"Could not convert `{value}` to datetime.")
 
-    tz = tz or UTC
-
     if dt.tzinfo:
-        return dt if dt.tzinfo == tz else dt.astimezone(tz)
-    return dt.replace(tzinfo=tz)
+        return dt if dt.tzinfo == target_tz else dt.astimezone(target_tz)
+    return dt.replace(tzinfo=target_tz)
 
 
 def to_date(value: TimeLike, relative_base: t.Optional[datetime] = None) -> date:
-    """Converts a value into a UTC date object
+    """Converts a value into a date object.
     Args:
         value: A variety of date formats. If the value is number-like, it is assumed to be millisecond epochs.
         relative_base: The datetime to reference for time expressions that are using relative terms
@@ -267,7 +303,7 @@ def to_date(value: TimeLike, relative_base: t.Optional[datetime] = None) -> date
         ValueError if value cannot be converted to a date.
 
     Returns:
-        A date object with tz utc.
+        A date object.
     """
     return to_datetime(value, relative_base).date()
 

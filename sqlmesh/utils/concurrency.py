@@ -1,5 +1,6 @@
 import typing as t
 from concurrent.futures import Executor, Future, ThreadPoolExecutor
+import contextvars
 from threading import Lock
 
 from sqlmesh.core.snapshot import SnapshotId, SnapshotInfoLike
@@ -98,7 +99,8 @@ class ConcurrentDAGExecutor(t.Generic[H]):
 
         for submitted_node in submitted_nodes:
             self._unprocessed_nodes.pop(submitted_node)
-            executor.submit(self._process_node, submitted_node, executor)
+            ctx = contextvars.copy_context()
+            executor.submit(ctx.run, self._process_node, submitted_node, executor)
 
     def _skip_next_nodes(self, parent: H) -> None:
         if not self._unprocessed_nodes_num:
@@ -273,6 +275,7 @@ def concurrent_apply_to_values(
 
     with ThreadPoolExecutor(max_workers=tasks_num) as pool:
         for index, value in enumerate(values):
-            pool.submit(_process_value, value, index)
+            ctx = contextvars.copy_context()
+            pool.submit(ctx.run, _process_value, value, index)
 
     return [f.result() for f in futures]

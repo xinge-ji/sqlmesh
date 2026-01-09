@@ -17,6 +17,7 @@ except ImportError:
     logger.error(
         'Unable to set __version__, run "pip install -e ." or "python setup.py develop" first.'
     )
+    SQLMESH_VERSION = "0.0.0"
 
 
 T = t.TypeVar("T")
