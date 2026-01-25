@@ -369,6 +369,23 @@ class DorisEngineAdapter(
             # Use base implementation for simple conditions
             super().delete_from(table_name, where)
 
+    def insert_overwrite_by_partition(
+        self,
+        table_name: TableName,
+        query_or_df: QueryOrDF,
+        partitioned_by: t.List[exp.Expression],
+        target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
+        source_columns: t.Optional[t.List[str]] = None,
+    ) -> None:
+        normalized_partitioned_by, _ = self._parse_partition_expressions(partitioned_by)
+        super().insert_overwrite_by_partition(
+            table_name,
+            query_or_df,
+            normalized_partitioned_by,
+            target_columns_to_types=target_columns_to_types,
+            source_columns=source_columns,
+        )
+
     def _find_subquery_in_condition(
         self, where: exp.Expression
     ) -> t.Optional[t.Tuple[exp.Expression, exp.Expression, bool]]:
@@ -533,6 +550,7 @@ class DorisEngineAdapter(
         self,
         partitioned_by: t.List[exp.Expression],
         *,
+        partition_type: t.Optional[t.Union[str, exp.Expression]] = None,
         partition_interval_unit: t.Optional[IntervalUnit] = None,
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         catalog_name: t.Optional[str] = None,
@@ -571,6 +589,17 @@ class DorisEngineAdapter(
         # Parse partition kind and columns from partitioned_by expressions
         partitioned_by, partition_kind = self._parse_partition_expressions(partitioned_by)
 
+        def _partition_type_to_str(value: t.Optional[t.Union[str, exp.Expression]]) -> t.Optional[str]:
+            if value is None:
+                return None
+            if isinstance(value, exp.Expression):
+                if hasattr(value, "this"):
+                    return str(value.this)
+                return value.sql(dialect=self.dialect)
+            return str(value)
+
+        explicit_partition_type = _partition_type_to_str(partition_type)
+
         if partitions:
             if isinstance(partitions, exp.Tuple):
                 create_expressions = [
@@ -592,7 +621,10 @@ class DorisEngineAdapter(
                 inferred_list = any("VALUES IN" in t for t in texts)
             except Exception:
                 inferred_list = False
-        if partition_kind:
+        if explicit_partition_type:
+            kind_upper = explicit_partition_type.upper()
+            is_list = kind_upper == "LIST"
+        elif partition_kind:
             kind_upper = str(partition_kind).upper()
             is_list = kind_upper == "LIST"
         else:
@@ -934,6 +966,7 @@ class DorisEngineAdapter(
                     add_partition = False
             if add_partition:
                 partitions = table_properties_copy.pop("partitions", None)
+                partition_type = table_properties_copy.pop("partition_type", None)
 
                 # Build partition expression - different for materialized views vs tables
                 if is_materialized_view:
@@ -952,6 +985,7 @@ class DorisEngineAdapter(
                         target_columns_to_types=target_columns_to_types,
                         catalog_name=catalog_name,
                         partitions=partitions,
+                        partition_type=partition_type,
                     )
                     if partition_expr:
                         properties.append(partition_expr)
