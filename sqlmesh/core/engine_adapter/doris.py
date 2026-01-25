@@ -427,8 +427,13 @@ class DorisEngineAdapter(
         """
         column_expr, subquery, is_not_in = subquery_info
 
-        # Build join condition
-        join_condition = self._build_join_condition(column_expr, is_not_in)
+        if isinstance(column_expr, (exp.Column, exp.Tuple)):
+            # Build join condition
+            join_condition = self._build_join_condition(column_expr, is_not_in)
+        else:
+            join_condition = self._build_expression_join_condition(
+                column_expr, subquery, is_not_in
+            )
 
         # Build and execute DELETE statement
         target_sql = f"{exp.to_table(table_name).sql(dialect=self.dialect, identify=True)} AS `_t1`"
@@ -455,6 +460,33 @@ class DorisEngineAdapter(
         t1_col = exp.column(column.name, table="_t1")
         t2_col = exp.column(column.name, table="_t2")
         return t1_col.neq(t2_col) if is_not_in else t1_col.eq(t2_col)
+
+    def _build_expression_join_condition(
+        self, column_expr: exp.Expression, subquery: exp.Expression, is_not_in: bool
+    ) -> exp.Expression:
+        alias = "__sqlmesh_key"
+        subquery_select = subquery.this if isinstance(subquery, exp.Subquery) else None
+        if isinstance(subquery_select, exp.Select):
+            expressions = list(subquery_select.expressions)
+            if expressions:
+                first_expression = expressions[0]
+                if isinstance(first_expression, exp.Alias):
+                    alias = first_expression.alias_or_name
+                else:
+                    expressions[0] = exp.alias_(first_expression, alias, quoted=True)
+                    subquery_select.set("expressions", expressions)
+
+        t1_expr = self._qualify_expression(column_expr, "_t1")
+        t2_col = exp.column(alias, table="_t2")
+        return t1_expr.neq(t2_col) if is_not_in else t1_expr.eq(t2_col)
+
+    def _qualify_expression(self, expression: exp.Expression, table_alias: str) -> exp.Expression:
+        def _qualify(node: exp.Expression) -> exp.Expression:
+            if isinstance(node, exp.Column) and not node.table:
+                return exp.column(node.name, table=table_alias)
+            return node
+
+        return expression.transform(_qualify)
 
     def _create_table_from_columns(
         self,
