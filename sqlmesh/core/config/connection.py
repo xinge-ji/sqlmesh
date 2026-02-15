@@ -2410,7 +2410,7 @@ CONNECTION_CONFIG_TO_TYPE = {
     for tpe in subclasses(
         __name__,
         ConnectionConfig,
-        exclude=(ConnectionConfig, BaseDuckDBConnectionConfig),
+        exclude={ConnectionConfig, BaseDuckDBConnectionConfig},
     )
 }
 
@@ -2419,7 +2419,7 @@ DIALECT_TO_TYPE = {
     for tpe in subclasses(
         __name__,
         ConnectionConfig,
-        exclude=(ConnectionConfig, BaseDuckDBConnectionConfig),
+        exclude={ConnectionConfig, BaseDuckDBConnectionConfig},
     )
 }
 
@@ -2431,7 +2431,7 @@ INIT_DISPLAY_INFO_TO_TYPE = {
     for tpe in subclasses(
         __name__,
         ConnectionConfig,
-        exclude=(ConnectionConfig, BaseDuckDBConnectionConfig),
+        exclude={ConnectionConfig, BaseDuckDBConnectionConfig},
     )
 }
 
