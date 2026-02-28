@@ -24,7 +24,7 @@ dependencies = [
     "requests",
     "rich[jupyter]",
     "ruamel.yaml",
-    "sqlglot[rs]~=27.28.0",
+    "sqlglot[rs]~=28.10.0",
     "tenacity",
     "time-machine",
     "json-stream"
@@ -127,7 +127,7 @@ snowflake = [
 ]
 trino = ["trino"]
 web = [
-    "fastapi==0.115.5",
+    "fastapi==0.120.1",
     "watchfiles>=0.19.0",
     "uvicorn[standard]==0.22.0",
     "sse-starlette>=0.2.2",
@@ -135,7 +135,7 @@ web = [
 ]
 lsp = [
     # Duplicate of web
-    "fastapi==0.115.5",
+    "fastapi==0.120.1",
     "watchfiles>=0.19.0",
     # "uvicorn[standard]==0.22.0",
     "sse-starlette>=0.2.2",
