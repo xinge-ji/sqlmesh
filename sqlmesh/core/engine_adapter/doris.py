@@ -37,9 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 @set_catalog()
-class DorisEngineAdapter(
-    LogicalMergeMixin, PandasNativeFetchDFSupportMixin, NonTransactionalTruncateMixin
-):
+class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, NonTransactionalTruncateMixin):
     DIALECT = "doris"
     DEFAULT_BATCH_SIZE = 5000
     SUPPORTS_TRANSACTIONS = False
@@ -49,7 +47,7 @@ class DorisEngineAdapter(
     MAX_COLUMN_COMMENT_LENGTH = 255
     SUPPORTS_INDEXES = True
     SUPPORTS_REPLACE_TABLE = False
-    MAX_IDENTIFIER_LENGTH = 64
+    MAX_IDENTIFIER_LENGTH = None
     SUPPORTS_MATERIALIZED_VIEWS = True
     SUPPORTS_MATERIALIZED_VIEW_SCHEMA = True
     SUPPORTS_CREATE_DROP_CATALOG = False
@@ -141,9 +139,7 @@ class DorisEngineAdapter(
                 )
                 result.append(data_object)
             except (ValueError, AttributeError) as e:
-                logger.error(
-                    f"Error processing row: {e}, row: {(schema_name, table_name, table_type)}"
-                )
+                logger.error(f"Error processing row: {e}, row: {(schema_name, table_name, table_type)}")
                 continue
 
         return result
@@ -212,9 +208,7 @@ class DorisEngineAdapter(
         import pandas as pd
 
         if isinstance(query_or_df, pd.DataFrame):
-            values: t.List[t.Tuple[t.Any, ...]] = list(
-                query_or_df.itertuples(index=False, name=None)
-            )
+            values: t.List[t.Tuple[t.Any, ...]] = list(query_or_df.itertuples(index=False, name=None))
             target_columns_to_types, source_columns = self._columns_to_types(
                 query_or_df, target_columns_to_types, source_columns
             )
@@ -262,9 +256,7 @@ class DorisEngineAdapter(
                 table_description=table_description,
                 partitioned_by=partitioned_by,
                 partition_interval_unit=(
-                    materialized_properties.get("partition_interval_unit")
-                    if materialized_properties
-                    else None
+                    materialized_properties.get("partition_interval_unit") if materialized_properties else None
                 ),
                 table_kind="MATERIALIZED_VIEW",
             )
@@ -291,9 +283,7 @@ class DorisEngineAdapter(
         """
         if materialized and kwargs.get("view_properties"):
             view_properties = kwargs.pop("view_properties")
-            if view_properties.get("materialized_type") == "SYNC" and view_properties.get(
-                "source_table"
-            ):
+            if view_properties.get("materialized_type") == "SYNC" and view_properties.get("source_table"):
                 # Format the source table name properly for Doris
                 source_table = view_properties.get("source_table")
                 if isinstance(source_table, exp.Table):
@@ -327,14 +317,10 @@ class DorisEngineAdapter(
             )
         )
 
-    def _create_table_comment(
-        self, table_name: TableName, table_comment: str, table_kind: str = "TABLE"
-    ) -> None:
+    def _create_table_comment(self, table_name: TableName, table_comment: str, table_kind: str = "TABLE") -> None:
         table_sql = exp.to_table(table_name).sql(dialect=self.dialect, identify=True)
 
-        self.execute(
-            f'ALTER TABLE {table_sql} MODIFY COMMENT "{self._truncate_table_comment(table_comment)}"'
-        )
+        self.execute(f'ALTER TABLE {table_sql} MODIFY COMMENT "{self._truncate_table_comment(table_comment)}"')
 
     def _build_create_comment_column_exp(
         self, table: exp.Table, column_name: str, column_comment: str, table_kind: str = "TABLE"
@@ -342,9 +328,7 @@ class DorisEngineAdapter(
         table_sql = table.sql(dialect=self.dialect, identify=True)
         return f'ALTER TABLE {table_sql} MODIFY COLUMN {column_name} COMMENT "{self._truncate_column_comment(column_comment)}"'
 
-    def delete_from(
-        self, table_name: TableName, where: t.Optional[t.Union[str, exp.Expression]] = None
-    ) -> None:
+    def delete_from(self, table_name: TableName, where: t.Optional[t.Union[str, exp.Expression]] = None) -> None:
         """
         Delete from a table.
 
@@ -409,11 +393,7 @@ class DorisEngineAdapter(
 
     def _is_subquery_expression(self, expr: exp.Expression) -> bool:
         """Check if expression contains a subquery."""
-        return (
-            "query" in expr.args
-            and expr.args["query"]
-            and isinstance(expr.args["query"], exp.Subquery)
-        )
+        return "query" in expr.args and expr.args["query"] and isinstance(expr.args["query"], exp.Subquery)
 
     def _execute_delete_with_subquery(
         self, table_name: TableName, subquery_info: t.Tuple[exp.Expression, exp.Expression, bool]
@@ -431,9 +411,7 @@ class DorisEngineAdapter(
             # Build join condition
             join_condition = self._build_join_condition(column_expr, is_not_in)
         else:
-            join_condition = self._build_expression_join_condition(
-                column_expr, subquery, is_not_in
-            )
+            join_condition = self._build_expression_join_condition(column_expr, subquery, is_not_in)
 
         # Build and execute DELETE statement
         target_sql = f"{exp.to_table(table_name).sql(dialect=self.dialect, identify=True)} AS `_t1`"
@@ -515,9 +493,7 @@ class DorisEngineAdapter(
         # Convert primary_key to unique_key for Doris (Doris doesn't support primary keys)
         if primary_key and "unique_key" not in table_properties:
             # Represent as a Tuple of columns to match downstream handling
-            table_properties["unique_key"] = exp.Tuple(
-                expressions=[exp.to_column(col) for col in primary_key]
-            )
+            table_properties["unique_key"] = exp.Tuple(expressions=[exp.to_column(col) for col in primary_key])
 
         # Update kwargs with the modified table_properties
         kwargs["table_properties"] = table_properties
@@ -635,9 +611,7 @@ class DorisEngineAdapter(
         if partitions:
             if isinstance(partitions, exp.Tuple):
                 create_expressions = [
-                    exp.Var(this=e.this, quoted=False)
-                    if isinstance(e, exp.Literal)
-                    else to_raw_sql(e)
+                    exp.Var(this=e.this, quoted=False) if isinstance(e, exp.Literal) else to_raw_sql(e)
                     for e in partitions.expressions
                 ]
             elif isinstance(partitions, exp.Literal):
@@ -737,11 +711,7 @@ class DorisEngineAdapter(
             unit_var: t.Optional[exp.Var] = None
             starts_lit: t.Optional[exp.Literal] = None
             for e in tpl.expressions:
-                if (
-                    isinstance(e, exp.EQ)
-                    and isinstance(e.this, exp.Column)
-                    and isinstance(e.this.this, exp.Identifier)
-                ):
+                if isinstance(e, exp.EQ) and isinstance(e.this, exp.Column) and isinstance(e.this.this, exp.Identifier):
                     key = str(e.this.this.this).strip('"').lower()
                     val = e.expression
                     if key == "method":
@@ -810,9 +780,7 @@ class DorisEngineAdapter(
                 starts_lit: t.Optional[exp.Literal] = None
 
                 if isinstance(refresh_val, exp.Tuple):
-                    method_var, kind_str, every_lit, unit_var, starts_lit = _parse_refresh_tuple(
-                        refresh_val
-                    )
+                    method_var, kind_str, every_lit, unit_var, starts_lit = _parse_refresh_tuple(refresh_val)
                 else:
                     if refresh_trigger_val is not None:
                         trigger_text = (
@@ -842,72 +810,48 @@ class DorisEngineAdapter(
                     # Extract column names from Tuple expressions
                     column_names = []
                     for expr in unique_key.expressions:
-                        if (
-                            isinstance(expr, exp.Column)
-                            and hasattr(expr, "this")
-                            and hasattr(expr.this, "this")
-                        ):
+                        if isinstance(expr, exp.Column) and hasattr(expr, "this") and hasattr(expr.this, "this"):
                             column_names.append(str(expr.this.this))
                         elif hasattr(expr, "this"):
                             column_names.append(str(expr.this))
                         else:
                             column_names.append(str(expr))
-                    properties.append(
-                        exp.UniqueKeyProperty(expressions=[exp.to_column(k) for k in column_names])
-                    )
+                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(k) for k in column_names]))
                 elif isinstance(unique_key, exp.Column):
                     # Handle as single column
                     if hasattr(unique_key, "this") and hasattr(unique_key.this, "this"):
                         column_name = str(unique_key.this.this)
                     else:
                         column_name = str(unique_key.this)
-                    properties.append(
-                        exp.UniqueKeyProperty(expressions=[exp.to_column(column_name)])
-                    )
+                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(column_name)]))
                 elif isinstance(unique_key, exp.Literal):
-                    properties.append(
-                        exp.UniqueKeyProperty(expressions=[exp.to_column(unique_key.this)])
-                    )
+                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(unique_key.this)]))
                 elif isinstance(unique_key, str):
-                    properties.append(
-                        exp.UniqueKeyProperty(expressions=[exp.to_column(unique_key)])
-                    )
+                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(unique_key)]))
             else:
                 # For materialized views, also add UniqueKeyProperty
                 if isinstance(unique_key, exp.Tuple):
                     # Extract column names from Tuple expressions
                     column_names = []
                     for expr in unique_key.expressions:
-                        if (
-                            isinstance(expr, exp.Column)
-                            and hasattr(expr, "this")
-                            and hasattr(expr.this, "this")
-                        ):
+                        if isinstance(expr, exp.Column) and hasattr(expr, "this") and hasattr(expr.this, "this"):
                             column_names.append(str(expr.this.this))
                         elif hasattr(expr, "this"):
                             column_names.append(str(expr.this))
                         else:
                             column_names.append(str(expr))
-                    properties.append(
-                        exp.UniqueKeyProperty(expressions=[exp.to_column(k) for k in column_names])
-                    )
+                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(k) for k in column_names]))
                 elif isinstance(unique_key, exp.Column):
                     # Handle as single column
                     if hasattr(unique_key, "this") and hasattr(unique_key.this, "this"):
                         column_name = str(unique_key.this.this)
                     else:
                         column_name = str(unique_key.this)
-                    properties.append(
-                        exp.UniqueKeyProperty(expressions=[exp.to_column(column_name)])
-                    )
+                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(column_name)]))
                 elif isinstance(unique_key, exp.Literal):
-                    properties.append(
-                        exp.UniqueKeyProperty(expressions=[exp.to_column(unique_key.this)])
-                    )
+                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(unique_key.this)]))
                 elif isinstance(unique_key, str):
-                    properties.append(
-                        exp.UniqueKeyProperty(expressions=[exp.to_column(unique_key)])
-                    )
+                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(unique_key)]))
 
         # Handle duplicate_key - only handle Tuple expressions or single Column expressions
         # Both tables and materialized views support duplicate keys in Doris
@@ -917,42 +861,28 @@ class DorisEngineAdapter(
                 # Extract column names from Tuple expressions
                 column_names = []
                 for expr in duplicate_key.expressions:
-                    if (
-                        isinstance(expr, exp.Column)
-                        and hasattr(expr, "this")
-                        and hasattr(expr.this, "this")
-                    ):
+                    if isinstance(expr, exp.Column) and hasattr(expr, "this") and hasattr(expr.this, "this"):
                         column_names.append(str(expr.this.this))
                     elif hasattr(expr, "this"):
                         column_names.append(str(expr.this))
                     else:
                         column_names.append(str(expr))
-                properties.append(
-                    exp.DuplicateKeyProperty(expressions=[exp.to_column(k) for k in column_names])
-                )
+                properties.append(exp.DuplicateKeyProperty(expressions=[exp.to_column(k) for k in column_names]))
             elif isinstance(duplicate_key, exp.Column):
                 # Handle as single column
                 if hasattr(duplicate_key, "this") and hasattr(duplicate_key.this, "this"):
                     column_name = str(duplicate_key.this.this)
                 else:
                     column_name = str(duplicate_key.this)
-                properties.append(
-                    exp.DuplicateKeyProperty(expressions=[exp.to_column(column_name)])
-                )
+                properties.append(exp.DuplicateKeyProperty(expressions=[exp.to_column(column_name)]))
             elif isinstance(duplicate_key, exp.Literal):
-                properties.append(
-                    exp.DuplicateKeyProperty(expressions=[exp.to_column(duplicate_key.this)])
-                )
+                properties.append(exp.DuplicateKeyProperty(expressions=[exp.to_column(duplicate_key.this)]))
             elif isinstance(duplicate_key, str):
-                properties.append(
-                    exp.DuplicateKeyProperty(expressions=[exp.to_column(duplicate_key)])
-                )
+                properties.append(exp.DuplicateKeyProperty(expressions=[exp.to_column(duplicate_key)]))
 
         if table_description:
             properties.append(
-                exp.SchemaCommentProperty(
-                    this=exp.Literal.string(self._truncate_table_comment(table_description))
-                )
+                exp.SchemaCommentProperty(this=exp.Literal.string(self._truncate_table_comment(table_description)))
             )
 
         # Handle partitioning
@@ -966,11 +896,7 @@ class DorisEngineAdapter(
                 key_cols_set = set()
                 if isinstance(unique_key, exp.Tuple):
                     for expr in unique_key.expressions:
-                        if (
-                            isinstance(expr, exp.Column)
-                            and hasattr(expr, "this")
-                            and hasattr(expr.this, "this")
-                        ):
+                        if isinstance(expr, exp.Column) and hasattr(expr, "this") and hasattr(expr.this, "this"):
                             key_cols_set.add(str(expr.this.this))
                         elif hasattr(expr, "this"):
                             key_cols_set.add(str(expr.this))
@@ -1038,16 +964,12 @@ class DorisEngineAdapter(
                         elif isinstance(expr.expression, exp.Array):
                             # Handle expressions array
                             distributed_info[key] = [
-                                str(e.this)
-                                for e in expr.expression.expressions
-                                if hasattr(e, "this")
+                                str(e.this) for e in expr.expression.expressions if hasattr(e, "this")
                             ]
                         elif isinstance(expr.expression, exp.Tuple):
                             # Handle expressions tuple (array of strings)
                             distributed_info[key] = [
-                                str(e.this)
-                                for e in expr.expression.expressions
-                                if hasattr(e, "this")
+                                str(e.this) for e in expr.expression.expressions if hasattr(e, "this")
                             ]
                         else:
                             distributed_info[key] = str(expr.expression)
@@ -1100,19 +1022,13 @@ class DorisEngineAdapter(
                     )
                     properties.append(prop)
         else:
-            unique_key_property = next(
-                (prop for prop in properties if isinstance(prop, exp.UniqueKeyProperty)), None
-            )
+            unique_key_property = next((prop for prop in properties if isinstance(prop, exp.UniqueKeyProperty)), None)
             if unique_key_property:
                 # Use the first column from unique_key as the distribution key
                 if unique_key_property.expressions:
                     first_col = unique_key_property.expressions[0]
-                    column_name = (
-                        str(first_col.this) if hasattr(first_col, "this") else str(first_col)
-                    )
-                    logger.info(
-                        f"[Doris] Adding default distributed_by using unique_key column: {column_name}"
-                    )
+                    column_name = str(first_col.this) if hasattr(first_col, "this") else str(first_col)
+                    logger.info(f"[Doris] Adding default distributed_by using unique_key column: {column_name}")
                     properties.append(
                         exp.DistributedByProperty(
                             expressions=[exp.to_column(column_name)],
