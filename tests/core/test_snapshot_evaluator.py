@@ -4503,6 +4503,41 @@ def test_multiple_engine_cleanup(snapshot: Snapshot, adapters, make_snapshot):
     )
 
 
+def test_cleanup_skips_unavailable_gateway(snapshot: Snapshot, adapters, make_snapshot):
+    engine_adapters = {"default": adapters[0]}
+    evaluator = SnapshotEvaluator(engine_adapters)
+
+    model_with_missing_gw = load_sql_based_model(
+        parse(  # type: ignore
+            """
+            MODEL (
+                name test_schema.test_model,
+                kind FULL,
+                gateway nonexistent_gateway,
+            );
+            SELECT a::int FROM tbl;
+            """
+        ),
+    )
+
+    snapshot_missing_gw = make_snapshot(model_with_missing_gw)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+    snapshot_missing_gw.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    evaluator.create([snapshot], {}, DeployabilityIndex.all_deployable())
+
+    evaluator.cleanup(
+        [
+            SnapshotTableCleanupTask(snapshot=snapshot.table_info, dev_table_only=True),
+            SnapshotTableCleanupTask(snapshot=snapshot_missing_gw.table_info, dev_table_only=True),
+        ],
+    )
+
+    engine_adapters["default"].drop_table.assert_called_once_with(
+        f"sqlmesh__db.db__model__{snapshot.version}__dev", cascade=True
+    )
+
+
 def test_multi_engine_python_model_with_macros(adapters, make_snapshot):
     engine_adapters = {"default": adapters[0], "secondary": adapters[1]}
     evaluator = SnapshotEvaluator(engine_adapters)

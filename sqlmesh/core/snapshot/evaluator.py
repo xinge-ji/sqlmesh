@@ -528,12 +528,27 @@ class SnapshotEvaluator:
         target_snapshots = [
             t for t in target_snapshots if t.snapshot.is_model and not t.snapshot.is_symbolic
         ]
+        available_gateways = set(self.adapters.keys())
+        skipped = []
+        filtered_targets = []
+        for t in target_snapshots:
+            gw = t.snapshot.model_gateway
+            if gw and gw not in available_gateways:
+                skipped.append((t.snapshot.snapshot_id, gw))
+            else:
+                filtered_targets.append(t)
+        if skipped:
+            logger.warning(
+                "Skipping cleanup of %d snapshot(s) with unavailable gateway(s): %s",
+                len(skipped),
+                ", ".join(f"{sid} (gateway={gw})" for sid, gw in skipped),
+            )
         snapshots_to_dev_table_only = {
-            t.snapshot.snapshot_id: t.dev_table_only for t in target_snapshots
+            t.snapshot.snapshot_id: t.dev_table_only for t in filtered_targets
         }
         with self.concurrent_context():
             concurrent_apply_to_snapshots(
-                [t.snapshot for t in target_snapshots],
+                [t.snapshot for t in filtered_targets],
                 lambda s: self._cleanup_snapshot(
                     s,
                     snapshots_to_dev_table_only[s.snapshot_id],
