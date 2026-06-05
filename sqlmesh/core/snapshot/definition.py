@@ -1890,9 +1890,9 @@ def fingerprint_from_node(
 
         parent_data_hash = hash_data(sorted(p.to_version() for p in parents))
 
-        parent_metadata_hash = hash_data(
-            sorted(h for p in parents for h in (p.metadata_hash, p.parent_metadata_hash))
-        )
+        # Keep metadata-only changes local to the snapshot itself. Parent data changes
+        # still propagate through parent_data_hash, so local metadata does not need to.
+        parent_metadata_hash = hash_data(sorted(p.parent_metadata_hash for p in parents))
 
         cache[node.fqn] = SnapshotFingerprint(
             data_hash=node.data_hash,

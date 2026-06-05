@@ -1032,6 +1032,25 @@ def test_fingerprint(model: Model, parent_model: Model):
     assert fingerprint.metadata_hash != original_fingerprint.metadata_hash
 
 
+def test_fingerprint_does_not_fan_out_on_parent_metadata_change(
+    model: Model, parent_model: Model
+):
+    fingerprint = fingerprint_from_node(
+        model,
+        nodes={parent_model.fqn: parent_model, model.fqn: model},
+    )
+
+    updated_parent = parent_model.copy(update={"owner": "new_owner"})
+    updated_parent_fingerprint = fingerprint_from_node(updated_parent, nodes={})
+    updated_fingerprint = fingerprint_from_node(
+        model,
+        nodes={updated_parent.fqn: updated_parent, model.fqn: model},
+    )
+
+    assert updated_parent_fingerprint != fingerprint_from_node(parent_model, nodes={})
+    assert updated_fingerprint == fingerprint
+
+
 def test_fingerprint_seed_model():
     expressions = parse(
         """

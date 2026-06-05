@@ -1208,6 +1208,7 @@ class SnapshotEvaluator:
                 dry_run=False,
                 run_pre_post_statements=run_pre_post_statements,
                 skip_grants=True,  # skip grants for tmp table
+                schema_migration_source=True,
             )
         try:
             evaluation_strategy = _evaluation_strategy(snapshot, adapter)
@@ -1476,6 +1477,7 @@ class SnapshotEvaluator:
         dry_run: bool,
         run_pre_post_statements: bool = True,
         skip_grants: bool = False,
+        schema_migration_source: bool = False,
     ) -> None:
         adapter = self.get_adapter(snapshot.model.gateway)
         evaluation_strategy = _evaluation_strategy(snapshot, adapter)
@@ -1503,6 +1505,7 @@ class SnapshotEvaluator:
             is_snapshot_representative=is_snapshot_representative,
             dry_run=dry_run,
             physical_properties=rendered_physical_properties,
+            schema_migration_source=schema_migration_source,
             snapshot=snapshot,
             deployability_index=deployability_index,
         )
@@ -2063,6 +2066,11 @@ class MaterializableStrategy(PromotableStrategy, abc.ABC):
         physical_properties = _add_unique_key_to_physical_properties_for_doris(
             model, physical_properties
         )
+        schema_migration_source_kwargs = (
+            {"schema_migration_source": True}
+            if kwargs.get("schema_migration_source") and self.adapter.dialect == "doris"
+            else {}
+        )
 
         logger.info("Creating table '%s'", table_name)
         if model.annotated:
@@ -2077,6 +2085,7 @@ class MaterializableStrategy(PromotableStrategy, abc.ABC):
                 table_properties=physical_properties,
                 table_description=model.description if is_table_deployable else None,
                 column_descriptions=model.column_descriptions if is_table_deployable else None,
+                **schema_migration_source_kwargs,
             )
 
             # If we create both temp and prod tables, we need to make sure that we dry run once.
@@ -2101,6 +2110,7 @@ class MaterializableStrategy(PromotableStrategy, abc.ABC):
                 table_properties=physical_properties,
                 table_description=model.description if is_table_deployable else None,
                 column_descriptions=model.column_descriptions if is_table_deployable else None,
+                **schema_migration_source_kwargs,
             )
 
         # Apply grants after table creation (unless explicitly skipped by caller)

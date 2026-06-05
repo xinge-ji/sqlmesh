@@ -669,6 +669,7 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
         target_columns_to_types: t.Optional[t.Dict[str, exp.DataType]] = None,
         table_description: t.Optional[str] = None,
         table_kind: t.Optional[str] = None,
+        schema_migration_source: bool = False,
         **kwargs: t.Any,
     ) -> t.Optional[exp.Properties]:
         """Creates a SQLGlot table properties expression for ddl."""
@@ -680,6 +681,14 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
             properties.append(exp.MaterializedProperty())
 
         table_properties_copy = dict(table_properties) if table_properties else {}
+
+        if schema_migration_source:
+            # SQLMesh uses *_schema_tmp tables only for DESCRIBE-based column diffing.
+            # Avoid creating the full production partition layout for these Doris temp tables.
+            partitioned_by = None
+            partition_interval_unit = None
+            table_properties_copy.pop("partitions", None)
+            table_properties_copy.pop("partition_type", None)
 
         # Helper functions for materialized view properties
         def _to_upper_str(val: t.Any) -> str:

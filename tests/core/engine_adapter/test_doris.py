@@ -287,6 +287,37 @@ def test_create_table_with_partitioned_by(
     ]
 
 
+def test_schema_migration_source_table_skips_partition_layout(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    adapter.create_table(
+        "test_table_schema_tmp",
+        target_columns_to_types={
+            "ds": exp.DataType.build("DATE"),
+            "id": exp.DataType.build("INT"),
+        },
+        partitioned_by=[exp.Literal.string("RANGE(ds)")],
+        table_properties={
+            "unique_key": exp.Tuple(expressions=[exp.to_column("ds"), exp.to_column("id")]),
+            "distributed_by": {
+                "kind": "HASH",
+                "expressions": ["ds"],
+                "buckets": 1,
+            },
+            "partitions": exp.Literal.string(
+                "FROM ('2000-01-01') TO ('2049-12-31') INTERVAL 1 MONTH"
+            ),
+            "replication_allocation": "tag.location.default: 3",
+        },
+        schema_migration_source=True,
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `test_table_schema_tmp` (`ds` DATE, `id` INT) UNIQUE KEY (`ds`, `id`) DISTRIBUTED BY HASH (`ds`) BUCKETS 1 PROPERTIES ('replication_allocation'='tag.location.default: 3')",
+    ]
+
+
 def test_create_table_with_range_partitioned_by_with_partitions(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
 ):
