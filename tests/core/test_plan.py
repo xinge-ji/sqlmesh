@@ -1950,6 +1950,549 @@ def test_indirectly_modified_forward_only_model(make_snapshot, mocker: MockerFix
     assert not deployability_index.is_representative(updated_snapshot_c)
 
 
+def test_column_level_indirect_modification_filters_unrelated_downstream(make_snapshot):
+    snapshot_a = make_snapshot(
+        SqlModel(name="a", query=parse_one("select 1 as changed_col, 2 as stable_col, ds"))
+    )
+    updated_snapshot_a = make_snapshot(
+        SqlModel(name="a", query=parse_one("select 3 as changed_col, 2 as stable_col, ds"))
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select stable_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select changed_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_c = make_snapshot(snapshot_c.model, nodes={'"a"': updated_snapshot_a.model})
+
+    context_diff = ContextDiff(
+        environment="test_environment",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={
+            updated_snapshot_a.name: (updated_snapshot_a, snapshot_a),
+            updated_snapshot_b.name: (updated_snapshot_b, snapshot_b),
+            updated_snapshot_c.name: (updated_snapshot_c, snapshot_c),
+        },
+        snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+            updated_snapshot_c.snapshot_id: updated_snapshot_c,
+        },
+        new_snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+            updated_snapshot_c.snapshot_id: updated_snapshot_c,
+        },
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+        environment_statements=[],
+    )
+
+    plan = PlanBuilder(context_diff).build()
+
+    assert plan.directly_modified == {updated_snapshot_a.snapshot_id}
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {updated_snapshot_c.snapshot_id}
+    }
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.METADATA
+    assert updated_snapshot_c.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+
+
+def test_column_level_indirect_modification_for_output_type_change(make_snapshot):
+    snapshot_a = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as changed_col, 2 as stable_col, ds"),
+            columns={
+                "changed_col": exp.DataType.build("int"),
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+    updated_snapshot_a = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as changed_col, 2 as stable_col, ds"),
+            columns={
+                "changed_col": exp.DataType.build("bigint"),
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select stable_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select changed_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_c = make_snapshot(snapshot_c.model, nodes={'"a"': updated_snapshot_a.model})
+
+    context_diff = ContextDiff(
+        environment="test_environment",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={
+            updated_snapshot_a.name: (updated_snapshot_a, snapshot_a),
+            updated_snapshot_b.name: (updated_snapshot_b, snapshot_b),
+            updated_snapshot_c.name: (updated_snapshot_c, snapshot_c),
+        },
+        snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+            updated_snapshot_c.snapshot_id: updated_snapshot_c,
+        },
+        new_snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+            updated_snapshot_c.snapshot_id: updated_snapshot_c,
+        },
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+        environment_statements=[],
+    )
+
+    plan = PlanBuilder(context_diff).build()
+
+    assert plan.directly_modified == {updated_snapshot_a.snapshot_id}
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {updated_snapshot_c.snapshot_id}
+    }
+    assert updated_snapshot_a.change_category == SnapshotChangeCategory.NON_BREAKING
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.METADATA
+    assert updated_snapshot_c.change_category == SnapshotChangeCategory.INDIRECT_NON_BREAKING
+
+
+def test_column_level_indirect_modification_includes_star_downstream_for_added_column(
+    make_snapshot,
+):
+    snapshot_a = make_snapshot(SqlModel(name="a", query=parse_one("select 2 as stable_col, ds")))
+    updated_snapshot_a = make_snapshot(
+        SqlModel(name="a", query=parse_one("select 2 as stable_col, ds, 3 as new_col"))
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select stable_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select * from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_c = make_snapshot(snapshot_c.model, nodes={'"a"': updated_snapshot_a.model})
+
+    context_diff = ContextDiff(
+        environment="test_environment",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={
+            updated_snapshot_a.name: (updated_snapshot_a, snapshot_a),
+            updated_snapshot_b.name: (updated_snapshot_b, snapshot_b),
+            updated_snapshot_c.name: (updated_snapshot_c, snapshot_c),
+        },
+        snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+            updated_snapshot_c.snapshot_id: updated_snapshot_c,
+        },
+        new_snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+            updated_snapshot_c.snapshot_id: updated_snapshot_c,
+        },
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+        environment_statements=[],
+    )
+
+    plan = PlanBuilder(context_diff).build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {updated_snapshot_c.snapshot_id}
+    }
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.METADATA
+    assert updated_snapshot_c.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+
+
+def test_column_level_indirect_modification_includes_non_projection_consumers(make_snapshot):
+    snapshot_a = make_snapshot(
+        SqlModel(name="a", query=parse_one("select 1 as filter_col, 2 as value_col, ds"))
+    )
+    updated_snapshot_a = make_snapshot(
+        SqlModel(name="a", query=parse_one("select 3 as filter_col, 2 as value_col, ds"))
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select value_col, ds from a where filter_col > 0")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select value_col, ds from b")),
+        nodes={'"b"': snapshot_b.model},
+    )
+    updated_snapshot_c = make_snapshot(
+        snapshot_c.model, nodes={'"b"': updated_snapshot_b.model, '"a"': updated_snapshot_a.model}
+    )
+
+    context_diff = ContextDiff(
+        environment="test_environment",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={
+            updated_snapshot_a.name: (updated_snapshot_a, snapshot_a),
+            updated_snapshot_b.name: (updated_snapshot_b, snapshot_b),
+            updated_snapshot_c.name: (updated_snapshot_c, snapshot_c),
+        },
+        snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+            updated_snapshot_c.snapshot_id: updated_snapshot_c,
+        },
+        new_snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+            updated_snapshot_c.snapshot_id: updated_snapshot_c,
+        },
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+        environment_statements=[],
+    )
+
+    plan = PlanBuilder(context_diff).build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {
+            updated_snapshot_b.snapshot_id,
+            updated_snapshot_c.snapshot_id,
+        }
+    }
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+    assert updated_snapshot_c.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+
+
+@pytest.mark.parametrize(
+    ("old_physical_properties", "new_physical_properties"),
+    [
+        ("(unique_key = 'id')", "(unique_key = 'id_ds')"),
+        ("(partition_by = 'ds')", "(partition_by = 'id')"),
+    ],
+)
+def test_semantic_physical_property_change_propagates_to_all_downstream(
+    make_snapshot, old_physical_properties, new_physical_properties
+):
+    snapshot_a = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, 2 as stable_col, ds"),
+            physical_properties=d.parse_one(old_physical_properties),
+        )
+    )
+    updated_snapshot_a = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, 2 as stable_col, ds"),
+            physical_properties=d.parse_one(new_physical_properties),
+        )
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select stable_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select id, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_c = make_snapshot(snapshot_c.model, nodes={'"a"': updated_snapshot_a.model})
+
+    context_diff = ContextDiff(
+        environment="test_environment",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={
+            updated_snapshot_a.name: (updated_snapshot_a, snapshot_a),
+            updated_snapshot_b.name: (updated_snapshot_b, snapshot_b),
+            updated_snapshot_c.name: (updated_snapshot_c, snapshot_c),
+        },
+        snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+            updated_snapshot_c.snapshot_id: updated_snapshot_c,
+        },
+        new_snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+            updated_snapshot_c.snapshot_id: updated_snapshot_c,
+        },
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+        environment_statements=[],
+    )
+
+    plan = PlanBuilder(context_diff).build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {
+            updated_snapshot_b.snapshot_id,
+            updated_snapshot_c.snapshot_id,
+        }
+    }
+    assert updated_snapshot_a.change_category == SnapshotChangeCategory.BREAKING
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+    assert updated_snapshot_c.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+
+
+def test_layout_physical_property_change_does_not_propagate_downstream(make_snapshot):
+    snapshot_a = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, 2 as stable_col, ds"),
+            physical_properties=d.parse_one("(distributed_by = 'hash_id_16')"),
+        )
+    )
+    updated_snapshot_a = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, 2 as stable_col, ds"),
+            physical_properties=d.parse_one("(distributed_by = 'hash_id_32')"),
+        )
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select stable_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select id, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_c = make_snapshot(snapshot_c.model, nodes={'"a"': updated_snapshot_a.model})
+
+    context_diff = ContextDiff(
+        environment="test_environment",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={
+            updated_snapshot_a.name: (updated_snapshot_a, snapshot_a),
+            updated_snapshot_b.name: (updated_snapshot_b, snapshot_b),
+            updated_snapshot_c.name: (updated_snapshot_c, snapshot_c),
+        },
+        snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+            updated_snapshot_c.snapshot_id: updated_snapshot_c,
+        },
+        new_snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+            updated_snapshot_c.snapshot_id: updated_snapshot_c,
+        },
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+        environment_statements=[],
+    )
+
+    plan = PlanBuilder(context_diff).build()
+
+    assert plan.directly_modified == {updated_snapshot_a.snapshot_id}
+    assert plan.indirectly_modified == {}
+    assert updated_snapshot_a.change_category == SnapshotChangeCategory.NON_BREAKING
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.METADATA
+    assert updated_snapshot_c.change_category == SnapshotChangeCategory.METADATA
+
+
+def test_unknown_physical_property_change_propagates_to_all_downstream(make_snapshot):
+    snapshot_a = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, 2 as stable_col, ds"),
+            physical_properties=d.parse_one("(custom_engine_option = 'old')"),
+        )
+    )
+    updated_snapshot_a = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, 2 as stable_col, ds"),
+            physical_properties=d.parse_one("(custom_engine_option = 'new')"),
+        )
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select stable_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    context_diff = ContextDiff(
+        environment="test_environment",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={
+            updated_snapshot_a.name: (updated_snapshot_a, snapshot_a),
+            updated_snapshot_b.name: (updated_snapshot_b, snapshot_b),
+        },
+        snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+        },
+        new_snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+        },
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+        environment_statements=[],
+    )
+
+    plan = PlanBuilder(context_diff).build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {updated_snapshot_b.snapshot_id}
+    }
+    assert updated_snapshot_a.change_category == SnapshotChangeCategory.BREAKING
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+
+
+def test_non_column_level_change_propagates_to_all_downstream(make_snapshot):
+    snapshot_a = make_snapshot(
+        SqlModel(name="a", query=parse_one("select value_col, ds from tbl where filter_col > 0"))
+    )
+    updated_snapshot_a = make_snapshot(
+        SqlModel(name="a", query=parse_one("select value_col, ds from tbl where filter_col > 1"))
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select value_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_c = make_snapshot(snapshot_c.model, nodes={'"a"': updated_snapshot_a.model})
+
+    context_diff = ContextDiff(
+        environment="test_environment",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={
+            updated_snapshot_a.name: (updated_snapshot_a, snapshot_a),
+            updated_snapshot_b.name: (updated_snapshot_b, snapshot_b),
+            updated_snapshot_c.name: (updated_snapshot_c, snapshot_c),
+        },
+        snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+            updated_snapshot_c.snapshot_id: updated_snapshot_c,
+        },
+        new_snapshots={
+            updated_snapshot_a.snapshot_id: updated_snapshot_a,
+            updated_snapshot_b.snapshot_id: updated_snapshot_b,
+            updated_snapshot_c.snapshot_id: updated_snapshot_c,
+        },
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+        environment_statements=[],
+    )
+
+    plan = PlanBuilder(context_diff).build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {
+            updated_snapshot_b.snapshot_id,
+            updated_snapshot_c.snapshot_id,
+        }
+    }
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+    assert updated_snapshot_c.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+
+
 def test_added_model_with_forward_only_parent(make_snapshot, mocker: MockerFixture):
     snapshot_a = make_snapshot(SqlModel(name="a", query=parse_one("select 1 as a, ds")))
     snapshot_a.categorize_as(SnapshotChangeCategory.BREAKING, forward_only=True)

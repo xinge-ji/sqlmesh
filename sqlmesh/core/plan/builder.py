@@ -7,6 +7,8 @@ from collections import defaultdict
 from functools import cached_property
 from datetime import datetime
 
+from sqlglot import exp
+from sqlglot.optimizer.simplify import gen
 
 from sqlmesh.core.console import PlanBuilderConsole, get_console
 from sqlmesh.core.config import (
@@ -15,7 +17,9 @@ from sqlmesh.core.config import (
     EnvironmentSuffixTarget,
 )
 from sqlmesh.core.context_diff import ContextDiff
+from sqlmesh.core.dialect import normalize_model_name
 from sqlmesh.core.environment import EnvironmentNamingInfo
+from sqlmesh.core.lineage import lineage as column_lineage
 from sqlmesh.core.plan.common import should_force_rebuild, is_breaking_kind_change
 from sqlmesh.core.plan.definition import (
     Plan,
@@ -50,6 +54,11 @@ from sqlmesh.utils.date import (
 from sqlmesh.utils.errors import NoChangesPlanError, PlanError
 
 logger = logging.getLogger(__name__)
+
+_PHYSICAL_PROPERTY_NONE = "none"
+_PHYSICAL_PROPERTY_SEMANTIC = "semantic"
+_PHYSICAL_PROPERTY_LAYOUT = "layout"
+_PHYSICAL_PROPERTY_UNKNOWN = "unknown"
 
 
 class PlanBuilder:
@@ -177,6 +186,7 @@ class PlanBuilder:
         self._user_provided_flags = user_provided_flags
         self._selected_models = selected_models
         self._explain = explain
+        self._effectively_indirectly_modified: t.Set[SnapshotId] = set()
 
         self._start = start
         if not self._start and (
@@ -290,6 +300,9 @@ class PlanBuilder:
 
         dag = self._build_dag()
         directly_modified, indirectly_modified = self._build_directly_and_indirectly_modified(dag)
+        self._effectively_indirectly_modified = {
+            s_id for downstream_s_ids in indirectly_modified.values() for s_id in downstream_s_ids
+        }
 
         self._check_destructive_additive_changes(directly_modified)
         self._categorize_snapshots(dag, indirectly_modified)
@@ -393,7 +406,7 @@ class PlanBuilder:
                 and (
                     # Metadata changes should not be previewed.
                     self._context_diff.directly_modified(s.name)
-                    or self._context_diff.indirectly_modified(s.name)
+                    or s.snapshot_id in self._effectively_indirectly_modified
                 )
             }
             is_preview = True
@@ -497,14 +510,178 @@ class PlanBuilder:
 
         indirectly_modified: SnapshotMapping = defaultdict(set)
         for snapshot in directly_modified:
-            for downstream_s_id in dag.downstream(snapshot.snapshot_id):
-                if downstream_s_id in all_indirectly_modified:
-                    indirectly_modified[snapshot.snapshot_id].add(downstream_s_id)
+            # Three propagation levels:
+            # - None: unknown or semantic change, conservatively propagate to all downstream.
+            # - non-empty set: column-level change, propagate through column lineage.
+            # - empty set: direct-only change, no regular downstream propagation.
+            affected_columns = self._directly_modified_output_columns(snapshot)
+            if affected_columns is None:
+                for downstream_s_id in dag.downstream(snapshot.snapshot_id):
+                    if downstream_s_id in all_indirectly_modified:
+                        indirectly_modified[snapshot.snapshot_id].add(downstream_s_id)
+                continue
+
+            self._add_column_level_downstream(
+                snapshot.snapshot_id,
+                affected_columns,
+                dag,
+                directly_modified,
+                all_indirectly_modified,
+                indirectly_modified,
+            )
 
         return (
             directly_modified,
             indirectly_modified,
         )
+
+    def _add_column_level_downstream(
+        self,
+        root_s_id: SnapshotId,
+        affected_columns: t.Set[str],
+        dag: DAG[SnapshotId],
+        directly_modified: t.Set[SnapshotId],
+        all_indirectly_modified: t.Set[SnapshotId],
+        indirectly_modified: SnapshotMapping,
+    ) -> None:
+        children_by_parent: t.Dict[SnapshotId, t.Set[SnapshotId]] = defaultdict(set)
+        for child_s_id, parent_s_ids in dag.graph.items():
+            for parent_s_id in parent_s_ids:
+                children_by_parent[parent_s_id].add(child_s_id)
+
+        queue: t.List[t.Tuple[SnapshotId, t.Optional[t.Set[str]]]] = [
+            (root_s_id, affected_columns)
+        ]
+        seen: t.Dict[SnapshotId, t.Optional[t.Set[str]]] = {root_s_id: affected_columns}
+
+        while queue:
+            parent_s_id, parent_columns = queue.pop(0)
+            parent_snapshot = self._context_diff.snapshots[parent_s_id]
+
+            for child_s_id in children_by_parent.get(parent_s_id, set()):
+                if child_s_id not in all_indirectly_modified and child_s_id not in directly_modified:
+                    continue
+
+                child_columns = self._downstream_columns_impacted_by_parent(
+                    child_s_id, parent_snapshot.name, parent_columns
+                )
+                if child_columns == set():
+                    continue
+
+                if child_s_id in all_indirectly_modified:
+                    indirectly_modified[root_s_id].add(child_s_id)
+
+                previous_columns = seen.get(child_s_id)
+                if previous_columns is None and child_s_id in seen:
+                    continue
+                if child_columns is None:
+                    seen[child_s_id] = None
+                    queue.append((child_s_id, None))
+                    continue
+                if previous_columns is not None and child_columns.issubset(previous_columns):
+                    continue
+
+                seen[child_s_id] = (previous_columns or set()) | child_columns
+                queue.append((child_s_id, child_columns))
+
+    def _directly_modified_output_columns(self, s_id: SnapshotId) -> t.Optional[t.Set[str]]:
+        if s_id.name not in self._context_diff.modified_snapshots:
+            return None
+
+        new, old = self._context_diff.modified_snapshots[s_id.name]
+        if not new.is_model or not old.is_model or not new.model.is_sql or not old.model.is_sql:
+            return None
+
+        if not _non_select_data_hash_values_match(new, old):
+            return None
+
+        try:
+            old_query = old.model.render_query()
+            new_query = new.model.render_query()
+        except Exception:
+            return None
+
+        if not isinstance(old_query, exp.Select) or not isinstance(new_query, exp.Select):
+            return None
+
+        old_without_selects = old_query.copy()
+        old_without_selects.set("expressions", [])
+        new_without_selects = new_query.copy()
+        new_without_selects.set("expressions", [])
+        if old_without_selects != new_without_selects:
+            return None
+
+        old_projections = _projection_map(old_query)
+        new_projections = _projection_map(new_query)
+        if old_projections is None or new_projections is None:
+            return None
+
+        affected_columns = {
+            column
+            for column in old_projections.keys() ^ new_projections.keys()
+            if column != "*"
+        }
+
+        for column in old_projections.keys() & new_projections.keys():
+            old_index, old_projection = old_projections[column]
+            new_index, new_projection = new_projections[column]
+            if old_projection != new_projection:
+                affected_columns.add(column)
+            elif old_index != new_index:
+                # Projection order changes primarily affect star consumers. Treat all columns as
+                # affected so downstream models that expand this model are conservatively included.
+                affected_columns.update(old_projections)
+                affected_columns.update(new_projections)
+
+        old_columns_to_types = old.model.columns_to_types
+        new_columns_to_types = new.model.columns_to_types
+        if old_columns_to_types is not None and new_columns_to_types is not None:
+            affected_columns.update(
+                _schema_changed_columns(old_columns_to_types, new_columns_to_types)
+            )
+
+        return affected_columns
+
+    def _downstream_columns_impacted_by_parent(
+        self,
+        child_s_id: SnapshotId,
+        parent_name: str,
+        parent_columns: t.Optional[t.Set[str]],
+    ) -> t.Optional[t.Set[str]]:
+        child_snapshot = self._context_diff.snapshots[child_s_id]
+        if child_snapshot.is_materialized_view:
+            # Materialized views need plan-level handling for any indirect parent change.
+            return _snapshot_output_columns(child_snapshot)
+
+        snapshots = [child_snapshot]
+        if child_snapshot.name in self._context_diff.modified_snapshots:
+            snapshots.append(self._context_diff.modified_snapshots[child_snapshot.name][1])
+
+        impacted_columns: t.Set[str] = set()
+        for snapshot in snapshots:
+            output_columns = _snapshot_output_columns(snapshot)
+            if output_columns is None:
+                return None
+
+            if parent_columns is None:
+                impacted_columns.update(output_columns)
+                continue
+
+            model = snapshot.model
+            if _parent_columns_used_outside_projections(model, parent_name, parent_columns):
+                impacted_columns.update(output_columns)
+                continue
+
+            for output_column in output_columns:
+                dependencies = _column_dependencies(model, output_column)
+                if dependencies is None:
+                    return None
+
+                dependency_columns = dependencies.get(parent_name)
+                if dependency_columns and not dependency_columns.isdisjoint(parent_columns):
+                    impacted_columns.add(output_column)
+
+        return impacted_columns
 
     def _build_models_to_backfill(
         self, dag: DAG[SnapshotId], restatements: t.Collection[SnapshotId]
@@ -657,6 +834,12 @@ class PlanBuilder:
                 if is_breaking_kind_change(old, new):
                     snapshot.categorize_as(SnapshotChangeCategory.BREAKING, False)
                     return
+                if _physical_property_change_category(new, old) in {
+                    _PHYSICAL_PROPERTY_SEMANTIC,
+                    _PHYSICAL_PROPERTY_UNKNOWN,
+                }:
+                    snapshot.categorize_as(SnapshotChangeCategory.BREAKING, forward_only)
+                    return
 
                 s_id_with_missing_columns: t.Optional[SnapshotId] = None
                 this_sid_with_downstream = indirectly_modified.get(s_id, set()) | {s_id}
@@ -679,7 +862,7 @@ class PlanBuilder:
                     )
                     if mode == AutoCategorizationMode.FULL:
                         snapshot.categorize_as(SnapshotChangeCategory.BREAKING, forward_only)
-        elif self._context_diff.indirectly_modified(snapshot.name):
+        elif s_id in self._effectively_indirectly_modified:
             if snapshot.is_materialized_view and not forward_only:
                 # We categorize changes as breaking to allow for instantaneous switches in a virtual layer.
                 # Otherwise, there might be a potentially long downtime during MVs recreation.
@@ -808,7 +991,7 @@ class PlanBuilder:
     def _is_forward_only_change(self, s_id: SnapshotId) -> bool:
         if not self._context_diff.directly_modified(
             s_id.name
-        ) and not self._context_diff.indirectly_modified(s_id.name):
+        ) and s_id not in self._effectively_indirectly_modified:
             return False
         snapshot = self._context_diff.snapshots[s_id]
         if snapshot.name in self._context_diff.modified_snapshots:
@@ -922,3 +1105,280 @@ class PlanBuilder:
             if snapshot.name in self._context_diff.modified_snapshots
             or snapshot.snapshot_id in self._context_diff.added
         ]
+
+
+def _non_select_data_hash_values_match(new: Snapshot, old: Snapshot) -> bool:
+    if type(new.model) is not type(old.model):
+        return False
+
+    physical_property_change_category = _physical_property_change_category(new, old)
+    if physical_property_change_category in {
+        _PHYSICAL_PROPERTY_SEMANTIC,
+        _PHYSICAL_PROPERTY_UNKNOWN,
+    }:
+        return False
+
+    old_model_without_columns = old.model.copy(
+        update={"columns_to_types_": None, "columns": None, "physical_properties": None}
+    )
+    new_model_without_columns = new.model.copy(
+        update={"columns_to_types_": None, "columns": None, "physical_properties": None}
+    )
+    if (
+        old_model_without_columns._data_hash_values_no_sql
+        != new_model_without_columns._data_hash_values_no_sql
+    ):
+        return False
+
+    # For SQL models the final SQL hash value is the model query. Earlier entries are pre/post
+    # statements, which can affect execution semantics beyond individual output columns.
+    return old.model._data_hash_values_sql[:-1] == new.model._data_hash_values_sql[:-1]
+
+
+def _physical_property_change_category(new: Snapshot, old: Snapshot) -> str:
+    old_properties = _serialized_physical_properties(old)
+    new_properties = _serialized_physical_properties(new)
+
+    changed_properties = {
+        key
+        for key in old_properties.keys() | new_properties.keys()
+        if old_properties.get(key) != new_properties.get(key)
+    }
+    if not changed_properties:
+        return _PHYSICAL_PROPERTY_NONE
+
+    categories = {_physical_property_category(key) for key in changed_properties}
+    if _PHYSICAL_PROPERTY_SEMANTIC in categories:
+        return _PHYSICAL_PROPERTY_SEMANTIC
+    if _PHYSICAL_PROPERTY_UNKNOWN in categories:
+        return _PHYSICAL_PROPERTY_UNKNOWN
+    return _PHYSICAL_PROPERTY_LAYOUT
+
+
+def _serialized_physical_properties(snapshot: Snapshot) -> t.Dict[str, str]:
+    return {
+        _normalize_physical_property_key(key): gen(value)
+        for key, value in snapshot.model.physical_properties.items()
+    }
+
+
+def _physical_property_category(key: str) -> str:
+    if key in {
+        "unique_key",
+        "primary_key",
+        "aggregate_key",
+        "duplicate_key",
+        "merge_key",
+        "replace_key",
+        "replacing_key",
+        "deduplicate_key",
+        "key",
+    }:
+        return _PHYSICAL_PROPERTY_SEMANTIC
+
+    if "partition" in key or key in {"ttl", "retention", "retention_period"}:
+        return _PHYSICAL_PROPERTY_SEMANTIC
+
+    if key in {
+        "distributed_by",
+        "distribution",
+        "distribution_key",
+        "bucket",
+        "buckets",
+        "bucket_count",
+        "cluster",
+        "cluster_by",
+        "clustered_by",
+        "sort_key",
+        "order_by",
+        "compression",
+        "codec",
+        "replication_num",
+        "replication",
+        "storage_policy",
+        "bloom_filter_columns",
+        "bloom_filter",
+        "index",
+    }:
+        return _PHYSICAL_PROPERTY_LAYOUT
+
+    return _PHYSICAL_PROPERTY_UNKNOWN
+
+
+def _normalize_physical_property_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
+
+
+def _projection_map(
+    query: exp.Select,
+) -> t.Optional[t.Dict[str, t.Tuple[int, exp.Expression]]]:
+    projections = {}
+    for index, projection in enumerate(query.selects):
+        if isinstance(projection, exp.Star) or projection.find(exp.Star):
+            return None
+
+        output_name = projection.output_name
+        if not output_name:
+            return None
+
+        column = _normalize_column_name(output_name)
+        if column in projections:
+            return None
+
+        projections[column] = (index, projection)
+
+    return projections
+
+
+def _schema_changed_columns(
+    old_columns_to_types: t.Dict[str, exp.DataType],
+    new_columns_to_types: t.Dict[str, exp.DataType],
+) -> t.Set[str]:
+    return {
+        _normalize_column_name(column)
+        for column in old_columns_to_types.keys() | new_columns_to_types.keys()
+        if old_columns_to_types.get(column) != new_columns_to_types.get(column)
+    }
+
+
+def _snapshot_output_columns(snapshot: Snapshot) -> t.Optional[t.Set[str]]:
+    if not snapshot.is_model or not snapshot.model.is_sql:
+        return None
+
+    columns_to_types = snapshot.model.columns_to_types
+    if columns_to_types is None:
+        return None
+
+    return {_normalize_column_name(column) for column in columns_to_types}
+
+
+def _column_dependencies(
+    model: t.Any,
+    output_column: str,
+) -> t.Optional[t.Dict[str, t.Set[str]]]:
+    try:
+        nodes = column_lineage(output_column, model, trim_selects=False).walk()
+    except Exception:
+        return None
+
+    parents: t.Dict[str, t.Set[str]] = defaultdict(set)
+    for node in nodes:
+        if node.downstream:
+            continue
+
+        table = node.expression.find(exp.Table)
+        if not table:
+            continue
+
+        parent_name = _normalize_table_name(table, model)
+        if parent_name is None:
+            return None
+
+        parents[parent_name].add(_normalize_column_name(node.name))
+
+    return parents
+
+
+def _parent_columns_used_outside_projections(
+    model: t.Any,
+    parent_name: str,
+    parent_columns: t.Set[str],
+) -> bool:
+    try:
+        query = model.render_query()
+    except Exception:
+        return True
+
+    if not isinstance(query, exp.Query):
+        return True
+
+    parent_aliases, only_source_is_parent = _parent_table_aliases(query, model, parent_name)
+    if not parent_aliases and not only_source_is_parent:
+        return False
+
+    normalized_parent_columns = {_normalize_column_name(column) for column in parent_columns}
+    projection_column_ids = {
+        id(column) for projection in query.selects for column in projection.find_all(exp.Column)
+    }
+
+    for column in query.find_all(exp.Column):
+        if id(column) in projection_column_ids:
+            continue
+
+        if _column_references_parent(
+            column,
+            model,
+            parent_name,
+            parent_aliases,
+            only_source_is_parent,
+        ) and _normalize_column_name(column.name) in normalized_parent_columns:
+            return True
+
+    return False
+
+
+def _parent_table_aliases(
+    query: exp.Query,
+    model: t.Any,
+    parent_name: str,
+) -> t.Tuple[t.Set[str], bool]:
+    aliases = set()
+    source_names = []
+
+    for table in query.find_all(exp.Table):
+        table_name = _normalize_table_name(table, model)
+        if table_name is None:
+            continue
+
+        source_names.append(table_name)
+        if table_name == parent_name:
+            aliases.add(table.name)
+            aliases.add(_normalize_column_name(table.name))
+            if table.alias:
+                aliases.add(table.alias)
+                aliases.add(_normalize_column_name(table.alias))
+
+    return aliases, len(source_names) == 1 and source_names[0] == parent_name
+
+
+def _column_references_parent(
+    column: exp.Column,
+    model: t.Any,
+    parent_name: str,
+    parent_aliases: t.Set[str],
+    only_source_is_parent: bool,
+) -> bool:
+    if column.table:
+        column_table = column.table
+        if column_table in parent_aliases or _normalize_column_name(column_table) in parent_aliases:
+            return True
+
+        table_ref = ".".join(part.sql(dialect=model.dialect) for part in column.parts[:-1])
+        if table_ref:
+            normalized_table_ref = normalize_model_name(
+                table_ref,
+                default_catalog=model.default_catalog,
+                dialect=model.dialect,
+            )
+            return normalized_table_ref == parent_name
+
+        return False
+
+    return only_source_is_parent
+
+
+def _normalize_table_name(table: exp.Table, model: t.Any) -> t.Optional[str]:
+    try:
+        unaliased = table.copy()
+        unaliased.set("alias", None)
+        return normalize_model_name(
+            unaliased,
+            default_catalog=model.default_catalog,
+            dialect=model.dialect,
+        )
+    except Exception:
+        return None
+
+
+def _normalize_column_name(column: str) -> str:
+    return exp.to_column(column).name
