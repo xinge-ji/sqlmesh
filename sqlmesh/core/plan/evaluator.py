@@ -181,6 +181,7 @@ class BuiltInPlanEvaluator(PlanEvaluator):
                 allow_destructive_snapshots=plan.allow_destructive_models,
                 allow_additive_snapshots=plan.allow_additive_models,
                 deployability_index=stage.deployability_index,
+                dev_table_intervals=stage.snapshot_to_intervals,
                 on_start=lambda x: self.console.start_creation_progress(
                     x, plan.environment, self.default_catalog
                 ),

@@ -63,12 +63,14 @@ class PhysicalLayerUpdateStage:
             no physical layer update is needed. This can be useful to report the lack of physical layer updates
             back to the user.
         all_snapshots: All snapshots in the plan by snapshot ID.
+        snapshot_to_intervals: Missing intervals computed for snapshots in the plan.
         snapshots_with_missing_intervals: Snapshots that have missing intervals.
         deployability_index: Deployability index for this stage.
     """
 
     snapshots: t.List[Snapshot]
     all_snapshots: t.Dict[SnapshotId, Snapshot]
+    snapshot_to_intervals: SnapshotToIntervals
     snapshots_with_missing_intervals: t.Set[SnapshotId]
     deployability_index: DeployabilityIndex
 
@@ -486,6 +488,7 @@ class PlanStagesBuilder:
         return PhysicalLayerUpdateStage(
             snapshots=snapshots_to_create,
             all_snapshots=all_snapshots,
+            snapshot_to_intervals=snapshots_to_intervals,
             snapshots_with_missing_intervals={
                 s.snapshot_id
                 for s in snapshots_to_intervals

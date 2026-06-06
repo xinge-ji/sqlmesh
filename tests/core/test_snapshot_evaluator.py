@@ -70,6 +70,8 @@ from sqlmesh.core.snapshot.evaluator import (
     SCDType2Strategy,
     SnapshotCreationFailedError,
     ViewStrategy,
+    _dev_doris_partition_text,
+    _normalize_dev_doris_table_partitions,
 )
 from sqlmesh.utils.concurrency import NodeExecutionFailedError
 from sqlmesh.utils.date import to_timestamp
@@ -5501,3 +5503,76 @@ def test_grants_in_production_with_dev_only_vde(
         # Should still apply grants to physical table when target layer is ALL or PHYSICAL
         sync_grants_mock.assert_called_once()
         assert sync_grants_mock.call_args[0][1] == {"select": ["user1"], "insert": ["role1"]}
+
+
+def test_dev_doris_partition_text_uses_interval_bounds() -> None:
+    intervals = [
+        (to_timestamp("2026-05-01"), to_timestamp("2026-06-01")),
+        (to_timestamp("2026-06-01"), to_timestamp("2026-06-06")),
+    ]
+
+    assert (
+        _dev_doris_partition_text(
+            "FROM ('2026-05-01') TO ('2049-12-31') INTERVAL 1 MONTH", intervals
+        )
+        == "FROM ('2026-05-01') TO ('2026-07-01') INTERVAL 1 MONTH"
+    )
+
+
+def test_dev_doris_partition_normalization_skips_prod_and_tmp(make_snapshot) -> None:
+    model = load_sql_based_model(
+        parse(
+            """
+            MODEL (
+                name test_schema.test_model,
+                dialect doris,
+                kind INCREMENTAL_BY_TIME_RANGE (
+                    time_column ds
+                ),
+                partitioned_by RANGE(ds),
+                physical_properties (
+                    partitions = "FROM ('2001-01-01') TO ('2049-12-31') INTERVAL 1 MONTH"
+                )
+            );
+
+            SELECT ds::DATE FROM foo;
+            """
+        )
+    )
+    snapshot = make_snapshot(model)
+    physical_properties = {
+        "partitions": exp.Literal.string(
+            "FROM ('2001-01-01') TO ('2049-12-31') INTERVAL 1 MONTH"
+        )
+    }
+    intervals = [(to_timestamp("2026-06-01"), to_timestamp("2026-06-06"))]
+
+    dev_properties = _normalize_dev_doris_table_partitions(
+        snapshot=snapshot,
+        rendered_physical_properties=physical_properties,
+        is_snapshot_deployable=False,
+        schema_migration_source=False,
+        intervals=intervals,
+    )
+    assert (
+        dev_properties["partitions"].this
+        == "FROM ('2026-06-01') TO ('2026-07-01') INTERVAL 1 MONTH"
+    )
+
+    prod_properties = _normalize_dev_doris_table_partitions(
+        snapshot=snapshot,
+        rendered_physical_properties=physical_properties,
+        is_snapshot_deployable=True,
+        schema_migration_source=False,
+        intervals=intervals,
+    )
+    assert prod_properties is physical_properties
+
+    tmp_properties = _normalize_dev_doris_table_partitions(
+        snapshot=snapshot,
+        rendered_physical_properties=physical_properties,
+        is_snapshot_deployable=False,
+        schema_migration_source=True,
+        intervals=intervals,
+    )
+    assert tmp_properties is physical_properties

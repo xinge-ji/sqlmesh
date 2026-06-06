@@ -562,6 +562,7 @@ class Scheduler:
                             allow_destructive_snapshots=allow_destructive_snapshots,
                             allow_additive_snapshots=allow_additive_snapshots,
                             target_table_exists=target_table_exists,
+                            dev_table_intervals=batched_intervals.get(snapshot),
                             selected_models=selected_models,
                         )
 
@@ -593,6 +594,7 @@ class Scheduler:
                     deployability_index=deployability_index,
                     allow_destructive_snapshots=allow_destructive_snapshots or set(),
                     allow_additive_snapshots=allow_additive_snapshots or set(),
+                    dev_table_intervals=batched_intervals.get(snapshot),
                 )
 
         try:

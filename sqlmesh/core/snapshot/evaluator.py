@@ -26,8 +26,10 @@ import abc
 import logging
 import typing as t
 import sys
+import re
 from collections import defaultdict
 from contextlib import contextmanager
+from datetime import date, timedelta
 from functools import reduce
 
 from sqlglot import exp, select
@@ -74,7 +76,7 @@ from sqlmesh.utils.concurrency import (
     concurrent_apply_to_values,
     NodeExecutionFailedError,
 )
-from sqlmesh.utils.date import TimeLike, now, time_like_to_str
+from sqlmesh.utils.date import TimeLike, now, time_like_to_str, to_datetime, to_timestamp
 from sqlmesh.utils.errors import (
     ConfigError,
     DestructiveChangeError,
@@ -366,6 +368,7 @@ class SnapshotEvaluator:
         on_complete: t.Optional[t.Callable[[SnapshotInfoLike], None]] = None,
         allow_destructive_snapshots: t.Optional[t.Set[str]] = None,
         allow_additive_snapshots: t.Optional[t.Set[str]] = None,
+        dev_table_intervals: t.Optional[t.Dict[Snapshot, Intervals]] = None,
     ) -> CompletionStatus:
         """Creates a physical snapshot schema and table for the given collection of snapshots.
 
@@ -377,6 +380,7 @@ class SnapshotEvaluator:
             on_complete: A callback to call on each successfully created snapshot.
             allow_destructive_snapshots: Set of snapshots that are allowed to have destructive schema changes.
             allow_additive_snapshots: Set of snapshots that are allowed to have additive schema changes.
+            dev_table_intervals: Intervals to use for dev-only physical table layout optimizations.
 
         Returns:
             CompletionStatus: The status of the creation operation (success, failure, nothing to do).
@@ -396,6 +400,7 @@ class SnapshotEvaluator:
             on_complete=on_complete,
             allow_destructive_snapshots=allow_destructive_snapshots or set(),
             allow_additive_snapshots=allow_additive_snapshots or set(),
+            dev_table_intervals=dev_table_intervals or {},
         )
         return CompletionStatus.SUCCESS
 
@@ -451,6 +456,7 @@ class SnapshotEvaluator:
         on_complete: t.Optional[t.Callable[[SnapshotInfoLike], None]],
         allow_destructive_snapshots: t.Set[str],
         allow_additive_snapshots: t.Set[str],
+        dev_table_intervals: t.Dict[Snapshot, Intervals],
     ) -> None:
         """Internal method to create tables in parallel."""
         with self.concurrent_context():
@@ -462,6 +468,7 @@ class SnapshotEvaluator:
                     deployability_index=deployability_index,
                     allow_destructive_snapshots=allow_destructive_snapshots,
                     allow_additive_snapshots=allow_additive_snapshots,
+                    dev_table_intervals=dev_table_intervals.get(s),
                     on_complete=on_complete,
                 ),
                 self.ddl_concurrent_tasks,
@@ -784,10 +791,12 @@ class SnapshotEvaluator:
                         rendered_physical_properties=rendered_physical_properties.copy(),
                         allow_destructive_snapshots=allow_destructive_snapshots,
                         allow_additive_snapshots=allow_additive_snapshots,
+                        dev_table_intervals=kwargs.get("dev_table_intervals"),
                     )
                     runtime_stage = RuntimeStage.EVALUATING
                     target_table_exists = True
                 elif should_create_empty_table or model.is_seed or model.kind.is_scd_type_2:
+                    dev_table_intervals = kwargs.get("dev_table_intervals") or [(start, end)]
                     self._execute_create(
                         snapshot=snapshot,
                         table_name=target_table_name,
@@ -795,6 +804,7 @@ class SnapshotEvaluator:
                         deployability_index=deployability_index,
                         create_render_kwargs=create_render_kwargs,
                         rendered_physical_properties=rendered_physical_properties.copy(),
+                        dev_table_intervals=dev_table_intervals,
                         dry_run=False,
                         run_pre_post_statements=False,
                     )
@@ -852,6 +862,7 @@ class SnapshotEvaluator:
         deployability_index: DeployabilityIndex,
         allow_destructive_snapshots: t.Set[str],
         allow_additive_snapshots: t.Set[str],
+        dev_table_intervals: t.Optional[Intervals] = None,
         on_complete: t.Optional[t.Callable[[SnapshotInfoLike], None]] = None,
     ) -> None:
         """Creates a physical table for the given snapshot.
@@ -899,6 +910,7 @@ class SnapshotEvaluator:
                     rendered_physical_properties=rendered_physical_properties,
                     allow_destructive_snapshots=allow_destructive_snapshots,
                     allow_additive_snapshots=allow_additive_snapshots,
+                    dev_table_intervals=dev_table_intervals,
                     run_pre_post_statements=True,
                 )
             else:
@@ -910,6 +922,7 @@ class SnapshotEvaluator:
                     deployability_index=deployability_index,
                     create_render_kwargs=create_render_kwargs,
                     rendered_physical_properties=rendered_physical_properties,
+                    dev_table_intervals=dev_table_intervals,
                     dry_run=True,
                 )
 
@@ -1072,6 +1085,7 @@ class SnapshotEvaluator:
         rendered_physical_properties: t.Dict[str, exp.Expression],
         allow_destructive_snapshots: t.Set[str],
         allow_additive_snapshots: t.Set[str],
+        dev_table_intervals: t.Optional[Intervals] = None,
         run_pre_post_statements: bool = False,
     ) -> None:
         adapter = self.get_adapter(snapshot.model.gateway)
@@ -1095,6 +1109,7 @@ class SnapshotEvaluator:
                 rendered_physical_properties=rendered_physical_properties,
                 allow_destructive_snapshots=allow_destructive_snapshots,
                 allow_additive_snapshots=allow_additive_snapshots,
+                dev_table_intervals=dev_table_intervals,
                 run_pre_post_statements=run_pre_post_statements,
             )
 
@@ -1189,6 +1204,7 @@ class SnapshotEvaluator:
         rendered_physical_properties: t.Dict[str, exp.Expression],
         allow_destructive_snapshots: t.Set[str],
         allow_additive_snapshots: t.Set[str],
+        dev_table_intervals: t.Optional[Intervals] = None,
         run_pre_post_statements: bool = False,
     ) -> None:
         adapter = self.get_adapter(snapshot.model.gateway)
@@ -1209,6 +1225,7 @@ class SnapshotEvaluator:
                 run_pre_post_statements=run_pre_post_statements,
                 skip_grants=True,  # skip grants for tmp table
                 schema_migration_source=True,
+                dev_table_intervals=dev_table_intervals,
             )
         try:
             evaluation_strategy = _evaluation_strategy(snapshot, adapter)
@@ -1478,6 +1495,7 @@ class SnapshotEvaluator:
         run_pre_post_statements: bool = True,
         skip_grants: bool = False,
         schema_migration_source: bool = False,
+        dev_table_intervals: t.Optional[Intervals] = None,
     ) -> None:
         adapter = self.get_adapter(snapshot.model.gateway)
         evaluation_strategy = _evaluation_strategy(snapshot, adapter)
@@ -1490,6 +1508,13 @@ class SnapshotEvaluator:
             **create_render_kwargs,
             "table_mapping": {snapshot.name: table_name},
         }
+        rendered_physical_properties = _normalize_dev_doris_table_partitions(
+            snapshot=snapshot,
+            rendered_physical_properties=rendered_physical_properties,
+            is_snapshot_deployable=is_snapshot_deployable,
+            schema_migration_source=schema_migration_source,
+            intervals=dev_table_intervals,
+        )
         if run_pre_post_statements:
             evaluation_strategy.run_pre_statements(
                 snapshot=snapshot,
@@ -2049,6 +2074,97 @@ def _add_unique_key_to_physical_properties_for_doris(
             else exp.Tuple(expressions=model.unique_key)
         )
     return physical_properties
+
+
+def _normalize_dev_doris_table_partitions(
+    *,
+    snapshot: Snapshot,
+    rendered_physical_properties: t.Dict[str, t.Any],
+    is_snapshot_deployable: bool,
+    schema_migration_source: bool,
+    intervals: t.Optional[Intervals],
+) -> t.Dict[str, t.Any]:
+    if (
+        is_snapshot_deployable
+        or schema_migration_source
+        or snapshot.model.dialect != "doris"
+        or not intervals
+        or "partitions" not in rendered_physical_properties
+    ):
+        return rendered_physical_properties
+
+    partitions = rendered_physical_properties["partitions"]
+    if isinstance(partitions, exp.Literal):
+        partition_text = str(partitions.this)
+    elif isinstance(partitions, str):
+        partition_text = partitions
+    else:
+        return rendered_physical_properties
+
+    normalized_partition_text = _dev_doris_partition_text(partition_text, intervals)
+    if not normalized_partition_text:
+        return rendered_physical_properties
+
+    updated_properties = dict(rendered_physical_properties)
+    updated_properties["partitions"] = exp.Literal.string(normalized_partition_text)
+    return updated_properties
+
+
+def _dev_doris_partition_text(partition_text: str, intervals: Intervals) -> t.Optional[str]:
+    match = re.match(
+        r"^\s*FROM\s*\(.+?\)\s+TO\s*\(.+?\)\s+INTERVAL\s+(?P<count>\d+)\s+(?P<unit>[A-Z]+)\s*$",
+        partition_text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+
+    count = int(match.group("count"))
+    unit = match.group("unit").upper()
+    if unit not in {"DAY", "MONTH", "YEAR"}:
+        return None
+
+    starts = [to_datetime(start) for start, _ in intervals]
+    ends = [to_datetime(end) for _, end in intervals]
+    if not starts or not ends:
+        return None
+
+    from_dt = _floor_doris_partition_boundary(min(starts), unit, count)
+    to_dt = _ceil_doris_partition_boundary(max(ends), unit, count)
+    return f"FROM ('{from_dt:%Y-%m-%d}') TO ('{to_dt:%Y-%m-%d}') INTERVAL {count} {unit}"
+
+
+def _floor_doris_partition_boundary(dt: TimeLike, unit: str, count: int) -> date:
+    value = to_datetime(dt)
+    if unit == "DAY":
+        day = value.date()
+        epoch = to_datetime("1970-01-01").date()
+        offset = (day - epoch).days // count * count
+        return epoch + timedelta(days=offset)
+    if unit == "MONTH":
+        month_index = value.year * 12 + value.month - 1
+        floored = month_index // count * count
+        return to_datetime(f"{floored // 12:04d}-{floored % 12 + 1:02d}-01").date()
+    if unit == "YEAR":
+        year = value.year // count * count
+        return to_datetime(f"{year:04d}-01-01").date()
+    raise ValueError(f"Unsupported Doris partition unit: {unit}")
+
+
+def _ceil_doris_partition_boundary(dt: TimeLike, unit: str, count: int) -> date:
+    value = to_datetime(dt)
+    floor = _floor_doris_partition_boundary(value, unit, count)
+    if to_timestamp(floor) == to_timestamp(value):
+        return floor
+
+    if unit == "DAY":
+        return floor + timedelta(days=count)
+    if unit == "MONTH":
+        month_index = floor.year * 12 + floor.month - 1 + count
+        return to_datetime(f"{month_index // 12:04d}-{month_index % 12 + 1:02d}-01").date()
+    if unit == "YEAR":
+        return to_datetime(f"{floor.year + count:04d}-01-01").date()
+    raise ValueError(f"Unsupported Doris partition unit: {unit}")
 
 
 class MaterializableStrategy(PromotableStrategy, abc.ABC):
