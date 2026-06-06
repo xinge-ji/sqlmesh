@@ -71,6 +71,8 @@ from sqlmesh.core.snapshot.evaluator import (
     SnapshotCreationFailedError,
     ViewStrategy,
     _dev_doris_partition_text,
+    _ensure_dev_doris_partitions_for_interval,
+    _evaluation_interval,
     _normalize_dev_doris_table_partitions,
 )
 from sqlmesh.utils.concurrency import NodeExecutionFailedError
@@ -5576,3 +5578,83 @@ def test_dev_doris_partition_normalization_skips_prod_and_tmp(make_snapshot) -> 
         intervals=intervals,
     )
     assert tmp_properties is physical_properties
+
+
+def test_ensure_dev_doris_partitions_only_for_dev_doris(make_snapshot, mocker) -> None:
+    model = load_sql_based_model(
+        parse(
+            """
+            MODEL (
+                name test_schema.test_model,
+                dialect doris,
+                kind INCREMENTAL_BY_TIME_RANGE (
+                    time_column ds
+                ),
+                partitioned_by RANGE(ds),
+                physical_properties (
+                    partitions = "FROM ('2001-01-01') TO ('2049-12-31') INTERVAL 1 MONTH"
+                )
+            );
+
+            SELECT ds::DATE FROM foo;
+            """
+        )
+    )
+    snapshot = make_snapshot(model)
+    adapter = mocker.Mock()
+    physical_properties = {
+        "partitions": exp.Literal.string(
+            "FROM ('2001-01-01') TO ('2049-12-31') INTERVAL 1 MONTH"
+        )
+    }
+    interval = (to_timestamp("2026-06-01"), to_timestamp("2026-07-01"))
+
+    _ensure_dev_doris_partitions_for_interval(
+        adapter=adapter,
+        snapshot=snapshot,
+        target_table_name="test_table__dev",
+        rendered_physical_properties=physical_properties,
+        is_snapshot_deployable=False,
+        interval=interval,
+    )
+    adapter.ensure_range_partitions.assert_called_once_with(
+        "test_table__dev",
+        "FROM ('2001-01-01') TO ('2049-12-31') INTERVAL 1 MONTH",
+        [interval],
+    )
+
+    adapter.ensure_range_partitions.reset_mock()
+    _ensure_dev_doris_partitions_for_interval(
+        adapter=adapter,
+        snapshot=snapshot,
+        target_table_name="test_table",
+        rendered_physical_properties=physical_properties,
+        is_snapshot_deployable=True,
+        interval=interval,
+    )
+    adapter.ensure_range_partitions.assert_not_called()
+
+
+def test_evaluation_interval_preserves_scheduler_half_open_interval(make_snapshot) -> None:
+    model = load_sql_based_model(
+        parse(
+            """
+            MODEL (
+                name test_schema.test_model,
+                kind INCREMENTAL_BY_TIME_RANGE (
+                    time_column ds
+                )
+            );
+
+            SELECT ds::DATE FROM foo;
+            """
+        )
+    )
+    snapshot = make_snapshot(model)
+    interval = (to_timestamp("2026-06-01"), to_timestamp("2026-07-01"))
+
+    assert _evaluation_interval(snapshot, *interval) == interval
+    assert _evaluation_interval(snapshot, "2026-06-01", "2026-06-01") == (
+        to_timestamp("2026-06-01"),
+        to_timestamp("2026-06-02"),
+    )

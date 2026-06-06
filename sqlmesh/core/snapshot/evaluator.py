@@ -69,6 +69,7 @@ from sqlmesh.core.snapshot import (
     SnapshotInfoLike,
     SnapshotTableCleanupTask,
 )
+from sqlmesh.core.snapshot.definition import Interval
 from sqlmesh.core.snapshot.execution_tracker import QueryExecutionTracker
 from sqlmesh.utils import random_id, CorrelationId, AttributeDict
 from sqlmesh.utils.concurrency import (
@@ -827,6 +828,15 @@ class SnapshotEvaluator:
                 wap_id = random_id()[0:8]
                 logger.info("Using WAP ID '%s' for snapshot %s", wap_id, snapshot.snapshot_id)
                 target_table_name = adapter.wap_prepare(target_table_name, wap_id)
+
+            _ensure_dev_doris_partitions_for_interval(
+                adapter=adapter,
+                snapshot=snapshot,
+                target_table_name=target_table_name,
+                rendered_physical_properties=rendered_physical_properties,
+                is_snapshot_deployable=is_snapshot_deployable,
+                interval=_evaluation_interval(snapshot, start, end),
+            )
 
             self._render_and_insert_snapshot(
                 start=start,
@@ -2093,12 +2103,8 @@ def _normalize_dev_doris_table_partitions(
     ):
         return rendered_physical_properties
 
-    partitions = rendered_physical_properties["partitions"]
-    if isinstance(partitions, exp.Literal):
-        partition_text = str(partitions.this)
-    elif isinstance(partitions, str):
-        partition_text = partitions
-    else:
+    partition_text = _doris_partition_text(rendered_physical_properties["partitions"])
+    if not partition_text:
         return rendered_physical_properties
 
     normalized_partition_text = _dev_doris_partition_text(partition_text, intervals)
@@ -2108,6 +2114,44 @@ def _normalize_dev_doris_table_partitions(
     updated_properties = dict(rendered_physical_properties)
     updated_properties["partitions"] = exp.Literal.string(normalized_partition_text)
     return updated_properties
+
+
+def _ensure_dev_doris_partitions_for_interval(
+    *,
+    adapter: t.Any,
+    snapshot: Snapshot,
+    target_table_name: str,
+    rendered_physical_properties: t.Dict[str, t.Any],
+    is_snapshot_deployable: bool,
+    interval: Interval,
+) -> None:
+    if (
+        is_snapshot_deployable
+        or snapshot.model.dialect != "doris"
+        or "partitions" not in rendered_physical_properties
+        or not hasattr(adapter, "ensure_range_partitions")
+    ):
+        return
+
+    partition_text = _doris_partition_text(rendered_physical_properties["partitions"])
+    if not partition_text:
+        return
+
+    adapter.ensure_range_partitions(target_table_name, partition_text, [interval])
+
+
+def _evaluation_interval(snapshot: Snapshot, start: TimeLike, end: TimeLike) -> Interval:
+    if isinstance(start, (int, float)) and isinstance(end, (int, float)):
+        return int(start), int(end)
+    return snapshot.inclusive_exclusive(start, end, strict=False)
+
+
+def _doris_partition_text(partitions: t.Any) -> t.Optional[str]:
+    if isinstance(partitions, exp.Literal):
+        return str(partitions.this)
+    if isinstance(partitions, str):
+        return partitions
+    return None
 
 
 def _dev_doris_partition_text(partition_text: str, intervals: Intervals) -> t.Optional[str]:
