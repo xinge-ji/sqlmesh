@@ -1,0 +1,23 @@
+{
+  "id": "2026-06-08-external-model-column-impact",
+  "mode": "feature",
+  "status": "done",
+  "title": "External model column-level downstream impact",
+  "slug": "external-model-column-impact",
+  "artifacts": {
+    "design": {
+      "path": "external-model-column-impact-design.md",
+      "approval": "approved"
+    },
+    "checklist": {
+      "path": "external-model-column-impact-checklist.yaml"
+    },
+    "implementation": {
+      "done": true
+    },
+    "acceptance": {
+      "path": "external-model-column-impact-acceptance.md",
+      "result": "passed"
+    }
+  }
+}

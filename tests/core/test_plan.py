@@ -2218,6 +2218,561 @@ def test_column_level_indirect_modification_includes_non_projection_consumers(ma
     assert updated_snapshot_c.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
 
 
+def _column_level_context_diff(
+    *modified_snapshots: t.Tuple[Snapshot, Snapshot],
+) -> ContextDiff:
+    snapshots = {new.snapshot_id: new for new, _ in modified_snapshots}
+    return ContextDiff(
+        environment="test_environment",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={new.name: (new, old) for new, old in modified_snapshots},
+        snapshots=snapshots,
+        new_snapshots=snapshots,
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+        environment_statements=[],
+    )
+
+
+def test_external_model_column_level_indirect_modification_for_type_change(make_snapshot):
+    snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "changed_col": exp.DataType.build("int"),
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+    updated_snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "changed_col": exp.DataType.build("bigint"),
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select stable_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select changed_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_c = make_snapshot(snapshot_c.model, nodes={'"a"': updated_snapshot_a.model})
+
+    plan = PlanBuilder(
+        _column_level_context_diff(
+            (updated_snapshot_a, snapshot_a),
+            (updated_snapshot_b, snapshot_b),
+            (updated_snapshot_c, snapshot_c),
+        )
+    ).build()
+
+    assert plan.directly_modified == {updated_snapshot_a.snapshot_id}
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {updated_snapshot_c.snapshot_id}
+    }
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.METADATA
+    assert updated_snapshot_c.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+
+
+def test_external_model_column_level_indirect_modification_for_varchar_length_change(
+    make_snapshot,
+):
+    snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "changed_col": exp.DataType.build("varchar(32)"),
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+    updated_snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "changed_col": exp.DataType.build("varchar(64)"),
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select stable_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select changed_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_c = make_snapshot(snapshot_c.model, nodes={'"a"': updated_snapshot_a.model})
+
+    plan = PlanBuilder(
+        _column_level_context_diff(
+            (updated_snapshot_a, snapshot_a),
+            (updated_snapshot_b, snapshot_b),
+            (updated_snapshot_c, snapshot_c),
+        )
+    ).build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {updated_snapshot_c.snapshot_id}
+    }
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.METADATA
+    assert updated_snapshot_c.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+
+
+def test_external_model_column_level_indirect_modification_includes_star_downstream_for_added_column(
+    make_snapshot,
+):
+    snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+    updated_snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+                "new_col": exp.DataType.build("int"),
+            },
+        )
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select stable_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select * from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_c = make_snapshot(snapshot_c.model, nodes={'"a"': updated_snapshot_a.model})
+
+    plan = PlanBuilder(
+        _column_level_context_diff(
+            (updated_snapshot_a, snapshot_a),
+            (updated_snapshot_b, snapshot_b),
+            (updated_snapshot_c, snapshot_c),
+        )
+    ).build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {updated_snapshot_c.snapshot_id}
+    }
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.METADATA
+    assert updated_snapshot_c.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+
+
+def test_external_model_column_level_indirect_modification_for_removed_column(make_snapshot):
+    snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "removed_col": exp.DataType.build("int"),
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+    updated_snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select stable_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select removed_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_c = make_snapshot(snapshot_c.model, nodes={'"a"': updated_snapshot_a.model})
+
+    plan = PlanBuilder(
+        _column_level_context_diff(
+            (updated_snapshot_a, snapshot_a),
+            (updated_snapshot_b, snapshot_b),
+            (updated_snapshot_c, snapshot_c),
+        )
+    ).build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {updated_snapshot_c.snapshot_id}
+    }
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.METADATA
+    assert updated_snapshot_c.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+
+
+def test_external_model_column_level_indirect_modification_includes_non_projection_consumers(
+    make_snapshot,
+):
+    snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "filter_col": exp.DataType.build("int"),
+                "value_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+    updated_snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "filter_col": exp.DataType.build("bigint"),
+                "value_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select value_col, ds from a where filter_col > 0")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select value_col, ds from b")),
+        nodes={'"b"': snapshot_b.model},
+    )
+    updated_snapshot_c = make_snapshot(
+        snapshot_c.model, nodes={'"b"': updated_snapshot_b.model, '"a"': updated_snapshot_a.model}
+    )
+
+    plan = PlanBuilder(
+        _column_level_context_diff(
+            (updated_snapshot_a, snapshot_a),
+            (updated_snapshot_b, snapshot_b),
+            (updated_snapshot_c, snapshot_c),
+        )
+    ).build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {
+            updated_snapshot_b.snapshot_id,
+            updated_snapshot_c.snapshot_id,
+        }
+    }
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+    assert updated_snapshot_c.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+
+
+def test_external_model_column_level_indirect_modification_propagates_multi_hop_lineage(
+    make_snapshot,
+):
+    snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "changed_col": exp.DataType.build("int"),
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+    updated_snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "changed_col": exp.DataType.build("bigint"),
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select changed_col as renamed_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select renamed_col, ds from b")),
+        nodes={'"b"': snapshot_b.model},
+    )
+    updated_snapshot_c = make_snapshot(
+        snapshot_c.model, nodes={'"b"': updated_snapshot_b.model, '"a"': updated_snapshot_a.model}
+    )
+
+    plan = PlanBuilder(
+        _column_level_context_diff(
+            (updated_snapshot_a, snapshot_a),
+            (updated_snapshot_b, snapshot_b),
+            (updated_snapshot_c, snapshot_c),
+        )
+    ).build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {
+            updated_snapshot_b.snapshot_id,
+            updated_snapshot_c.snapshot_id,
+        }
+    }
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+    assert updated_snapshot_c.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+
+
+def test_external_model_column_level_indirect_modification_missing_schema_falls_back_to_all_downstream(
+    make_snapshot,
+):
+    snapshot_a = make_snapshot(ExternalModel(name="a"))
+    updated_snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "changed_col": exp.DataType.build("int"),
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select stable_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select changed_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_c = make_snapshot(snapshot_c.model, nodes={'"a"': updated_snapshot_a.model})
+
+    builder = PlanBuilder(
+        _column_level_context_diff(
+            (updated_snapshot_a, snapshot_a),
+            (updated_snapshot_b, snapshot_b),
+            (updated_snapshot_c, snapshot_c),
+        )
+    )
+    builder.set_choice(updated_snapshot_a, SnapshotChangeCategory.BREAKING)
+    plan = builder.build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {
+            updated_snapshot_b.snapshot_id,
+            updated_snapshot_c.snapshot_id,
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    ("old_external_kwargs", "new_external_kwargs"),
+    [
+        pytest.param({"stamp": "old"}, {"stamp": "new"}, id="stamp"),
+        pytest.param({"gateway": "old_gateway"}, {"gateway": "new_gateway"}, id="gateway"),
+        pytest.param(
+            {"physical_schema_override": "old_schema"},
+            {"physical_schema_override": "new_schema"},
+            id="physical_schema",
+        ),
+        pytest.param(
+            {"physical_version": "old_version"},
+            {"physical_version": "new_version"},
+            id="physical_version",
+        ),
+        pytest.param(
+            {"physical_properties": d.parse_one("(replication_num = 1)")},
+            {"physical_properties": d.parse_one("(replication_num = 2)")},
+            id="known_physical_property",
+        ),
+        pytest.param(
+            {"physical_properties": d.parse_one("(unknown_external_property = 'old')")},
+            {"physical_properties": d.parse_one("(unknown_external_property = 'new')")},
+            id="unknown_physical_property",
+        ),
+    ],
+)
+def test_external_model_column_level_indirect_modification_non_column_change_falls_back_to_all_downstream(
+    make_snapshot,
+    old_external_kwargs: t.Dict[str, t.Any],
+    new_external_kwargs: t.Dict[str, t.Any],
+):
+    columns = {
+        "changed_col": exp.DataType.build("int"),
+        "stable_col": exp.DataType.build("int"),
+        "ds": exp.DataType.build("date"),
+    }
+    snapshot_a = make_snapshot(ExternalModel(name="a", columns=columns, **old_external_kwargs))
+    updated_snapshot_a = make_snapshot(
+        ExternalModel(name="a", columns=columns, **new_external_kwargs)
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select stable_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select changed_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_c = make_snapshot(snapshot_c.model, nodes={'"a"': updated_snapshot_a.model})
+
+    plan = PlanBuilder(
+        _column_level_context_diff(
+            (updated_snapshot_a, snapshot_a),
+            (updated_snapshot_b, snapshot_b),
+            (updated_snapshot_c, snapshot_c),
+        )
+    ).build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {
+            updated_snapshot_b.snapshot_id,
+            updated_snapshot_c.snapshot_id,
+        }
+    }
+
+
+def test_external_model_column_level_indirect_modification_column_order_change_is_conservative(
+    make_snapshot,
+):
+    snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "changed_col": exp.DataType.build("int"),
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+    updated_snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "stable_col": exp.DataType.build("int"),
+                "changed_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select stable_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select changed_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_c = make_snapshot(snapshot_c.model, nodes={'"a"': updated_snapshot_a.model})
+
+    plan = PlanBuilder(
+        _column_level_context_diff(
+            (updated_snapshot_a, snapshot_a),
+            (updated_snapshot_b, snapshot_b),
+            (updated_snapshot_c, snapshot_c),
+        )
+    ).build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {
+            updated_snapshot_b.snapshot_id,
+            updated_snapshot_c.snapshot_id,
+        }
+    }
+
+
+def test_external_model_column_level_indirect_modification_mixed_order_and_type_change_is_conservative(
+    make_snapshot,
+):
+    snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "changed_col": exp.DataType.build("int"),
+                "stable_col": exp.DataType.build("int"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+    updated_snapshot_a = make_snapshot(
+        ExternalModel(
+            name="a",
+            columns={
+                "stable_col": exp.DataType.build("int"),
+                "changed_col": exp.DataType.build("bigint"),
+                "ds": exp.DataType.build("date"),
+            },
+        )
+    )
+
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select stable_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    snapshot_c = make_snapshot(
+        SqlModel(name="c", query=parse_one("select changed_col, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_c = make_snapshot(snapshot_c.model, nodes={'"a"': updated_snapshot_a.model})
+
+    plan = PlanBuilder(
+        _column_level_context_diff(
+            (updated_snapshot_a, snapshot_a),
+            (updated_snapshot_b, snapshot_b),
+            (updated_snapshot_c, snapshot_c),
+        )
+    ).build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {
+            updated_snapshot_b.snapshot_id,
+            updated_snapshot_c.snapshot_id,
+        }
+    }
+
+
 @pytest.mark.parametrize(
     ("old_physical_properties", "new_physical_properties"),
     [

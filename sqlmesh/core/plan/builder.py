@@ -589,7 +589,16 @@ class PlanBuilder:
             return None
 
         new, old = self._context_diff.modified_snapshots[s_id.name]
-        if not new.is_model or not old.is_model or not new.model.is_sql or not old.model.is_sql:
+        if not new.is_model or not old.is_model:
+            return None
+
+        if new.model.kind.is_external and old.model.kind.is_external:
+            try:
+                return _external_model_directly_modified_output_columns(new, old)
+            except Exception:
+                return None
+
+        if not new.model.is_sql or not old.model.is_sql:
             return None
 
         if not _non_select_data_hash_values_match(new, old):
@@ -1203,6 +1212,39 @@ def _physical_property_category(key: str) -> str:
         return _PHYSICAL_PROPERTY_LAYOUT
 
     return _PHYSICAL_PROPERTY_UNKNOWN
+
+
+def _external_model_directly_modified_output_columns(
+    new: Snapshot,
+    old: Snapshot,
+) -> t.Optional[t.Set[str]]:
+    old_columns_to_types = old.model.columns_to_types
+    new_columns_to_types = new.model.columns_to_types
+    if old_columns_to_types is None or new_columns_to_types is None:
+        return None
+
+    old_model_without_columns = old.model.copy(update={"columns_to_types_": None, "columns": None})
+    new_model_without_columns = new.model.copy(update={"columns_to_types_": None, "columns": None})
+    if (
+        old_model_without_columns._data_hash_values_no_sql
+        != new_model_without_columns._data_hash_values_no_sql
+    ):
+        return None
+
+    old_column_data = old.model._data_hash_values_no_sql
+    new_column_data = new.model._data_hash_values_no_sql
+    affected_columns = _schema_changed_columns(old_columns_to_types, new_columns_to_types)
+    common_columns = old_columns_to_types.keys() & new_columns_to_types.keys()
+    old_common_columns = [column for column in old_columns_to_types if column in common_columns]
+    new_common_columns = [column for column in new_columns_to_types if column in common_columns]
+    if old_common_columns != new_common_columns:
+        affected_columns.update(_normalize_column_name(column) for column in old_columns_to_types)
+        affected_columns.update(_normalize_column_name(column) for column in new_columns_to_types)
+    elif not affected_columns and old_column_data != new_column_data:
+        affected_columns.update(_normalize_column_name(column) for column in old_columns_to_types)
+        affected_columns.update(_normalize_column_name(column) for column in new_columns_to_types)
+
+    return affected_columns
 
 
 def _normalize_physical_property_key(key: str) -> str:

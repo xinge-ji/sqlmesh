@@ -164,4 +164,5 @@ spark-warehouse/
 
 # claude
 .claude/
-
+.pi/
+.cyralis/
