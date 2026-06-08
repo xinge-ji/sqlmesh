@@ -12,6 +12,7 @@ import time_machine
 from pytest_mock.plugin import MockerFixture
 from sqlglot import parse_one, exp
 
+import sqlmesh.core.plan.builder as plan_builder
 from sqlmesh.core import dialect as d
 from sqlmesh.core.context import Context
 from sqlmesh.core.context_diff import ContextDiff
@@ -2242,6 +2243,56 @@ def _column_level_context_diff(
         environment_statements=[],
     )
 
+
+
+def test_column_level_indirect_modification_reuses_child_lineage_across_roots(
+    make_snapshot,
+    mocker: MockerFixture,
+):
+    snapshot_a = make_snapshot(
+        SqlModel(name="a", query=parse_one("select 1 as id, 2 as changed_col, 3 as stable_col, ds"))
+    )
+    updated_snapshot_a = make_snapshot(
+        SqlModel(name="a", query=parse_one("select 1 as id, 4 as changed_col, 3 as stable_col, ds"))
+    )
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select 1 as id, 5 as changed_col, ds"))
+    )
+    updated_snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select 1 as id, 6 as changed_col, ds"))
+    )
+    snapshot_c = make_snapshot(
+        SqlModel(
+            name="c",
+            query=parse_one(
+                "select a.changed_col as a_changed, b.changed_col as b_changed, "
+                "a.stable_col as stable_col, a.ds as ds from a join b on a.id = b.id"
+            ),
+        ),
+        nodes={'"a"': snapshot_a.model, '"b"': snapshot_b.model},
+    )
+    updated_snapshot_c = make_snapshot(
+        snapshot_c.model,
+        nodes={'"a"': updated_snapshot_a.model, '"b"': updated_snapshot_b.model},
+    )
+    column_lineage_spy = mocker.spy(plan_builder, "column_lineage")
+
+    plan = PlanBuilder(
+        _column_level_context_diff(
+            (updated_snapshot_a, snapshot_a),
+            (updated_snapshot_b, snapshot_b),
+            (updated_snapshot_c, snapshot_c),
+        )
+    ).build()
+
+    assert plan.indirectly_modified == {
+        updated_snapshot_a.snapshot_id: {updated_snapshot_c.snapshot_id},
+        updated_snapshot_b.snapshot_id: {updated_snapshot_c.snapshot_id},
+    }
+    lineage_calls = [
+        (id(call.args[1]), call.args[0]) for call in column_lineage_spy.call_args_list
+    ]
+    assert len(lineage_calls) == len(set(lineage_calls))
 
 def test_external_model_column_level_indirect_modification_for_type_change(make_snapshot):
     snapshot_a = make_snapshot(

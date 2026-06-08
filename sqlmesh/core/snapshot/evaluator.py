@@ -26,10 +26,8 @@ import abc
 import logging
 import typing as t
 import sys
-import re
 from collections import defaultdict
 from contextlib import contextmanager
-from datetime import date, timedelta
 from functools import reduce
 
 from sqlglot import exp, select
@@ -40,6 +38,7 @@ from sqlmesh.core import constants as c
 from sqlmesh.core import dialect as d
 from sqlmesh.core.audit import Audit, StandaloneAudit
 from sqlmesh.core.dialect import schema_
+from sqlmesh.core.engine_adapter.doris_partition import doris_partition_text_for_intervals
 from sqlmesh.core.engine_adapter.shared import InsertOverwriteStrategy, DataObjectType, DataObject
 from sqlmesh.core.model.meta import GrantsTargetLayer
 from sqlmesh.core.macros import RuntimeStage
@@ -77,7 +76,7 @@ from sqlmesh.utils.concurrency import (
     concurrent_apply_to_values,
     NodeExecutionFailedError,
 )
-from sqlmesh.utils.date import TimeLike, now, time_like_to_str, to_datetime, to_timestamp
+from sqlmesh.utils.date import TimeLike, now, time_like_to_str
 from sqlmesh.utils.errors import (
     ConfigError,
     DestructiveChangeError,
@@ -2155,60 +2154,7 @@ def _doris_partition_text(partitions: t.Any) -> t.Optional[str]:
 
 
 def _dev_doris_partition_text(partition_text: str, intervals: Intervals) -> t.Optional[str]:
-    match = re.match(
-        r"^\s*FROM\s*\(.+?\)\s+TO\s*\(.+?\)\s+INTERVAL\s+(?P<count>\d+)\s+(?P<unit>[A-Z]+)\s*$",
-        partition_text,
-        flags=re.IGNORECASE,
-    )
-    if not match:
-        return None
-
-    count = int(match.group("count"))
-    unit = match.group("unit").upper()
-    if unit not in {"DAY", "MONTH", "YEAR"}:
-        return None
-
-    starts = [to_datetime(start) for start, _ in intervals]
-    ends = [to_datetime(end) for _, end in intervals]
-    if not starts or not ends:
-        return None
-
-    from_dt = _floor_doris_partition_boundary(min(starts), unit, count)
-    to_dt = _ceil_doris_partition_boundary(max(ends), unit, count)
-    return f"FROM ('{from_dt:%Y-%m-%d}') TO ('{to_dt:%Y-%m-%d}') INTERVAL {count} {unit}"
-
-
-def _floor_doris_partition_boundary(dt: TimeLike, unit: str, count: int) -> date:
-    value = to_datetime(dt)
-    if unit == "DAY":
-        day = value.date()
-        epoch = to_datetime("1970-01-01").date()
-        offset = (day - epoch).days // count * count
-        return epoch + timedelta(days=offset)
-    if unit == "MONTH":
-        month_index = value.year * 12 + value.month - 1
-        floored = month_index // count * count
-        return to_datetime(f"{floored // 12:04d}-{floored % 12 + 1:02d}-01").date()
-    if unit == "YEAR":
-        year = value.year // count * count
-        return to_datetime(f"{year:04d}-01-01").date()
-    raise ValueError(f"Unsupported Doris partition unit: {unit}")
-
-
-def _ceil_doris_partition_boundary(dt: TimeLike, unit: str, count: int) -> date:
-    value = to_datetime(dt)
-    floor = _floor_doris_partition_boundary(value, unit, count)
-    if to_timestamp(floor) == to_timestamp(value):
-        return floor
-
-    if unit == "DAY":
-        return floor + timedelta(days=count)
-    if unit == "MONTH":
-        month_index = floor.year * 12 + floor.month - 1 + count
-        return to_datetime(f"{month_index // 12:04d}-{month_index % 12 + 1:02d}-01").date()
-    if unit == "YEAR":
-        return to_datetime(f"{floor.year + count:04d}-01-01").date()
-    raise ValueError(f"Unsupported Doris partition unit: {unit}")
+    return doris_partition_text_for_intervals(partition_text, intervals)
 
 
 class MaterializableStrategy(PromotableStrategy, abc.ABC):

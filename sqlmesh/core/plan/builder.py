@@ -59,6 +59,8 @@ _PHYSICAL_PROPERTY_NONE = "none"
 _PHYSICAL_PROPERTY_SEMANTIC = "semantic"
 _PHYSICAL_PROPERTY_LAYOUT = "layout"
 _PHYSICAL_PROPERTY_UNKNOWN = "unknown"
+_ColumnDependenciesCache = t.Dict[t.Tuple[int, str], t.Optional[t.Dict[str, t.Set[str]]]]
+_ParentColumnsUsedCache = t.Dict[t.Tuple[int, str, t.FrozenSet[str]], bool]
 
 
 class PlanBuilder:
@@ -509,6 +511,13 @@ class PlanBuilder:
                 directly_modified.add(s_id)
 
         indirectly_modified: SnapshotMapping = defaultdict(set)
+        children_by_parent: t.Dict[SnapshotId, t.Set[SnapshotId]] = defaultdict(set)
+        for child_s_id, parent_s_ids in dag.graph.items():
+            for parent_s_id in parent_s_ids:
+                children_by_parent[parent_s_id].add(child_s_id)
+
+        column_dependencies_cache: _ColumnDependenciesCache = {}
+        parent_columns_used_cache: _ParentColumnsUsedCache = {}
         for snapshot in directly_modified:
             # Three propagation levels:
             # - None: unknown or semantic change, conservatively propagate to all downstream.
@@ -524,10 +533,12 @@ class PlanBuilder:
             self._add_column_level_downstream(
                 snapshot.snapshot_id,
                 affected_columns,
-                dag,
+                children_by_parent,
                 directly_modified,
                 all_indirectly_modified,
                 indirectly_modified,
+                column_dependencies_cache,
+                parent_columns_used_cache,
             )
 
         return (
@@ -539,16 +550,13 @@ class PlanBuilder:
         self,
         root_s_id: SnapshotId,
         affected_columns: t.Set[str],
-        dag: DAG[SnapshotId],
+        children_by_parent: t.Dict[SnapshotId, t.Set[SnapshotId]],
         directly_modified: t.Set[SnapshotId],
         all_indirectly_modified: t.Set[SnapshotId],
         indirectly_modified: SnapshotMapping,
+        column_dependencies_cache: _ColumnDependenciesCache,
+        parent_columns_used_cache: _ParentColumnsUsedCache,
     ) -> None:
-        children_by_parent: t.Dict[SnapshotId, t.Set[SnapshotId]] = defaultdict(set)
-        for child_s_id, parent_s_ids in dag.graph.items():
-            for parent_s_id in parent_s_ids:
-                children_by_parent[parent_s_id].add(child_s_id)
-
         queue: t.List[t.Tuple[SnapshotId, t.Optional[t.Set[str]]]] = [
             (root_s_id, affected_columns)
         ]
@@ -563,7 +571,11 @@ class PlanBuilder:
                     continue
 
                 child_columns = self._downstream_columns_impacted_by_parent(
-                    child_s_id, parent_snapshot.name, parent_columns
+                    child_s_id,
+                    parent_snapshot.name,
+                    parent_columns,
+                    column_dependencies_cache,
+                    parent_columns_used_cache,
                 )
                 if child_columns == set():
                     continue
@@ -656,6 +668,8 @@ class PlanBuilder:
         child_s_id: SnapshotId,
         parent_name: str,
         parent_columns: t.Optional[t.Set[str]],
+        column_dependencies_cache: _ColumnDependenciesCache,
+        parent_columns_used_cache: _ParentColumnsUsedCache,
     ) -> t.Optional[t.Set[str]]:
         child_snapshot = self._context_diff.snapshots[child_s_id]
         if child_snapshot.is_materialized_view:
@@ -677,12 +691,16 @@ class PlanBuilder:
                 continue
 
             model = snapshot.model
-            if _parent_columns_used_outside_projections(model, parent_name, parent_columns):
+            if _parent_columns_used_outside_projections_cached(
+                model, parent_name, parent_columns, parent_columns_used_cache
+            ):
                 impacted_columns.update(output_columns)
                 continue
 
             for output_column in output_columns:
-                dependencies = _column_dependencies(model, output_column)
+                dependencies = _column_dependencies_cached(
+                    model, output_column, column_dependencies_cache
+                )
                 if dependencies is None:
                     return None
 
@@ -1321,6 +1339,32 @@ def _column_dependencies(
     return parents
 
 
+def _column_dependencies_cached(
+    model: t.Any,
+    output_column: str,
+    cache: _ColumnDependenciesCache,
+) -> t.Optional[t.Dict[str, t.Set[str]]]:
+    cache_key = (id(model), _normalize_column_name(output_column))
+    if cache_key not in cache:
+        cache[cache_key] = _column_dependencies(model, output_column)
+    return cache[cache_key]
+
+
+def _parent_columns_used_outside_projections_cached(
+    model: t.Any,
+    parent_name: str,
+    parent_columns: t.Set[str],
+    cache: _ParentColumnsUsedCache,
+) -> bool:
+    normalized_parent_columns = frozenset(
+        _normalize_column_name(column) for column in parent_columns
+    )
+    cache_key = (id(model), parent_name, normalized_parent_columns)
+    if cache_key not in cache:
+        cache[cache_key] = _parent_columns_used_outside_projections(
+            model, parent_name, set(normalized_parent_columns)
+        )
+    return cache[cache_key]
 def _parent_columns_used_outside_projections(
     model: t.Any,
     parent_name: str,

@@ -409,6 +409,33 @@ def test_ensure_range_partitions_adds_missing_month_partitions(
     ]
 
 
+def test_ensure_range_partitions_adds_missing_day_partition_for_non_midnight_end(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+    mocker: MockerFixture,
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    mocker.patch.object(
+        adapter,
+        "fetchall",
+        return_value=[
+            (
+                "p20260601",
+                "types: [DATE]; keys: [2026-06-01]; types: [DATE]; keys: [2026-06-02];",
+            ),
+        ],
+    )
+
+    adapter.ensure_range_partitions(
+        "test_schema.test_table",
+        "FROM ('2001-01-01') TO ('2049-12-31') INTERVAL 1 DAY",
+        [("2026-06-01 00:00:00", "2026-06-02 12:00:00")],
+    )
+
+    assert to_sql_calls(adapter) == [
+        "ALTER TABLE `test_schema`.`test_table` ADD PARTITION IF NOT EXISTS `p20260602` VALUES [('2026-06-02'), ('2026-06-03'))",
+    ]
+
+
 def test_ensure_range_partitions_skips_existing_covering_partition(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
     mocker: MockerFixture,
