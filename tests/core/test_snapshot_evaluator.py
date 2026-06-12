@@ -1141,6 +1141,35 @@ def test_create_tables_exist(
     adapter_mock.create_table.assert_not_called()
 
 
+def test_create_force_recreates_existing_table(
+    snapshot: Snapshot, mocker: MockerFixture, adapter_mock
+):
+    adapter_mock = mocker.patch("sqlmesh.core.engine_adapter.EngineAdapter")
+    adapter_mock.dialect = "duckdb"
+    adapter_mock.with_settings.return_value = adapter_mock
+
+    evaluator = SnapshotEvaluator(adapter_mock)
+    snapshot.categorize_as(category=SnapshotChangeCategory.BREAKING)
+
+    table_name = f"db__model__{snapshot.version}"
+    adapter_mock.get_data_objects.return_value = [
+        DataObject(
+            name=table_name,
+            schema="sqlmesh__db",
+            type=DataObjectType.TABLE,
+        ),
+    ]
+
+    evaluator.create(
+        target_snapshots=[snapshot],
+        snapshots={},
+        snapshots_to_recreate={snapshot.snapshot_id},
+    )
+
+    adapter_mock.drop_table.assert_called_once_with(snapshot.table_name())
+    adapter_mock.create_table.assert_called_once()
+
+
 def test_create_prod_table_exists_forward_only(mocker: MockerFixture, adapter_mock, make_snapshot):
     model = load_sql_based_model(
         parse(  # type: ignore

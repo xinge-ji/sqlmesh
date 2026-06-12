@@ -182,6 +182,7 @@ class BuiltInPlanEvaluator(PlanEvaluator):
                 allow_additive_snapshots=plan.allow_additive_models,
                 deployability_index=stage.deployability_index,
                 dev_table_intervals=stage.snapshot_to_intervals,
+                snapshots_to_recreate=stage.snapshots_to_recreate,
                 on_start=lambda x: self.console.start_creation_progress(
                     x, plan.environment, self.default_catalog
                 ),
@@ -258,6 +259,7 @@ class BuiltInPlanEvaluator(PlanEvaluator):
             allow_destructive_snapshots=plan.allow_destructive_models,
             allow_additive_snapshots=plan.allow_additive_models,
             selected_snapshot_ids=stage.selected_snapshot_ids,
+            snapshots_to_recreate=stage.snapshots_to_recreate,
             selected_models=plan.selected_models,
             is_restatement=bool(plan.restatements),
         )

@@ -3,6 +3,7 @@ import typing as t
 from sqlglot import parse_one
 from pytest_mock.plugin import MockerFixture
 
+from sqlmesh.core import dialect as d
 from sqlmesh.core.config import EnvironmentSuffixTarget
 from sqlmesh.core.config.common import VirtualEnvironmentMode
 from sqlmesh.core.model import SqlModel, ModelKindName
@@ -2186,5 +2187,103 @@ def test_adjust_intervals_should_force_rebuild(make_snapshot, mocker: MockerFixt
     backfill_stages = [stage for stage in stages if isinstance(stage, BackfillStage)]
     assert len(backfill_stages) == 1
     (snapshot, intervals) = next(iter(backfill_stages[0].snapshot_to_intervals.items()))
+    assert not snapshot.intervals
+    assert intervals == [(to_timestamp("2023-01-01"), to_timestamp("2023-01-02"))]
+
+
+def test_build_plan_stages_should_recreate_semantic_physical_drift(
+    make_snapshot, mocker: MockerFixture
+) -> None:
+    new_snapshot = make_snapshot(
+        SqlModel(
+            name="test_model",
+            query=parse_one("select cast('2023-01-01' as date) as ds, 1 as store_id, 2 as goods_id"),
+            kind=dict(name=ModelKindName.INCREMENTAL_BY_PARTITION),
+            dialect="doris",
+            partitioned_by=[parse_one("ds")],
+            physical_properties=d.parse_one("(unique_key = (ds, store_id))"),
+        )
+    )
+    new_snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+    new_snapshot.version = new_snapshot.version_get_or_generate()
+    new_snapshot.intervals = [(to_timestamp("2023-01-01"), to_timestamp("2023-01-02"))]
+
+    stored_model = new_snapshot.model.copy(
+        update={
+            "physical_properties_": d.parse_one("(unique_key = (ds, store_id, goods_id))"),
+        }
+    )
+    stored_model.__dict__.pop("physical_properties", None)
+    stored_snapshot = new_snapshot.copy(update={"node": stored_model})
+    stored_snapshot.intervals = [(to_timestamp("2023-01-01"), to_timestamp("2023-01-02"))]
+    new_snapshot.previous_versions = stored_snapshot.all_versions
+
+    state_reader = mocker.Mock(spec=StateReader)
+    state_reader.refresh_snapshot_intervals = mocker.Mock()
+    state_reader.get_snapshots.return_value = {stored_snapshot.snapshot_id: stored_snapshot}
+
+    existing_environment = Environment(
+        name="prod",
+        snapshots=[stored_snapshot.table_info],
+        start_at="2023-01-01",
+        end_at="2023-01-02",
+        plan_id="previous_plan",
+        promoted_snapshot_ids=[stored_snapshot.snapshot_id],
+        finalized_ts=to_timestamp("2023-01-02"),
+    )
+    state_reader.get_environment.return_value = existing_environment
+
+    environment = Environment(
+        snapshots=[new_snapshot.table_info],
+        start_at="2023-01-01",
+        end_at="2023-01-02",
+        plan_id="test_plan",
+        previous_plan_id="previous_plan",
+        promoted_snapshot_ids=[new_snapshot.snapshot_id],
+    )
+
+    plan = EvaluatablePlan(
+        start="2023-01-01",
+        end="2023-01-02",
+        new_snapshots=[new_snapshot],
+        environment=environment,
+        no_gaps=False,
+        skip_backfill=False,
+        empty_backfill=False,
+        restatements={},
+        restate_all_snapshots=False,
+        is_dev=False,
+        allow_destructive_models=set(),
+        allow_additive_models=set(),
+        forward_only=False,
+        end_bounded=False,
+        ensure_finalized_snapshots=False,
+        ignore_cron=False,
+        directly_modified_snapshots=[new_snapshot.snapshot_id],
+        indirectly_modified_snapshots={},
+        metadata_updated_snapshots=[],
+        removed_snapshots=[],
+        snapshots_requiring_physical_recreation={new_snapshot.snapshot_id},
+        requires_backfill=True,
+        models_to_backfill=None,
+        execution_time="2023-01-02",
+        disabled_restatement_models=set(),
+        environment_statements=None,
+        user_provided_flags=None,
+    )
+
+    stages = build_plan_stages(plan, state_reader, None)
+
+    assert not new_snapshot.intervals
+    assert all(not isinstance(stage, MigrateSchemasStage) for stage in stages)
+
+    physical_layer_stage = next(
+        stage for stage in stages if isinstance(stage, PhysicalLayerSchemaCreationStage)
+    )
+    assert physical_layer_stage.snapshots == [new_snapshot]
+
+    backfill_stage = next(stage for stage in stages if isinstance(stage, BackfillStage))
+    (snapshot, intervals) = next(iter(backfill_stage.snapshot_to_intervals.items()))
+    assert snapshot is new_snapshot
     assert not snapshot.intervals
     assert intervals == [(to_timestamp("2023-01-01"), to_timestamp("2023-01-02"))]

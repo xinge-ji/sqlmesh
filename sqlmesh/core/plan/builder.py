@@ -8,7 +8,6 @@ from functools import cached_property
 from datetime import datetime
 
 from sqlglot import exp
-from sqlglot.optimizer.simplify import gen
 
 from sqlmesh.core.console import PlanBuilderConsole, get_console
 from sqlmesh.core.config import (
@@ -20,7 +19,14 @@ from sqlmesh.core.context_diff import ContextDiff
 from sqlmesh.core.dialect import normalize_model_name
 from sqlmesh.core.environment import EnvironmentNamingInfo
 from sqlmesh.core.lineage import lineage as column_lineage
-from sqlmesh.core.plan.common import should_force_rebuild, is_breaking_kind_change
+from sqlmesh.core.plan.common import (
+    _PHYSICAL_PROPERTY_SEMANTIC,
+    _PHYSICAL_PROPERTY_UNKNOWN,
+    _physical_property_change_category,
+    is_breaking_kind_change,
+    requires_physical_recreation,
+    should_force_rebuild,
+)
 from sqlmesh.core.plan.definition import (
     Plan,
     SnapshotMapping,
@@ -55,10 +61,6 @@ from sqlmesh.utils.errors import NoChangesPlanError, PlanError
 
 logger = logging.getLogger(__name__)
 
-_PHYSICAL_PROPERTY_NONE = "none"
-_PHYSICAL_PROPERTY_SEMANTIC = "semantic"
-_PHYSICAL_PROPERTY_LAYOUT = "layout"
-_PHYSICAL_PROPERTY_UNKNOWN = "unknown"
 _ColumnDependenciesCache = t.Dict[t.Tuple[int, str], t.Optional[t.Dict[str, t.Set[str]]]]
 _ParentColumnsUsedCache = t.Dict[t.Tuple[int, str, t.FrozenSet[str]], bool]
 
@@ -865,6 +867,9 @@ class PlanBuilder:
                     _PHYSICAL_PROPERTY_SEMANTIC,
                     _PHYSICAL_PROPERTY_UNKNOWN,
                 }:
+                    if requires_physical_recreation(old, new):
+                        snapshot.categorize_as(SnapshotChangeCategory.BREAKING, False)
+                        return
                     snapshot.categorize_as(SnapshotChangeCategory.BREAKING, forward_only)
                     return
 
@@ -1162,76 +1167,6 @@ def _non_select_data_hash_values_match(new: Snapshot, old: Snapshot) -> bool:
     return old.model._data_hash_values_sql[:-1] == new.model._data_hash_values_sql[:-1]
 
 
-def _physical_property_change_category(new: Snapshot, old: Snapshot) -> str:
-    old_properties = _serialized_physical_properties(old)
-    new_properties = _serialized_physical_properties(new)
-
-    changed_properties = {
-        key
-        for key in old_properties.keys() | new_properties.keys()
-        if old_properties.get(key) != new_properties.get(key)
-    }
-    if not changed_properties:
-        return _PHYSICAL_PROPERTY_NONE
-
-    categories = {_physical_property_category(key) for key in changed_properties}
-    if _PHYSICAL_PROPERTY_SEMANTIC in categories:
-        return _PHYSICAL_PROPERTY_SEMANTIC
-    if _PHYSICAL_PROPERTY_UNKNOWN in categories:
-        return _PHYSICAL_PROPERTY_UNKNOWN
-    return _PHYSICAL_PROPERTY_LAYOUT
-
-
-def _serialized_physical_properties(snapshot: Snapshot) -> t.Dict[str, str]:
-    return {
-        _normalize_physical_property_key(key): gen(value)
-        for key, value in snapshot.model.physical_properties.items()
-    }
-
-
-def _physical_property_category(key: str) -> str:
-    if key in {
-        "unique_key",
-        "primary_key",
-        "aggregate_key",
-        "duplicate_key",
-        "merge_key",
-        "replace_key",
-        "replacing_key",
-        "deduplicate_key",
-        "key",
-    }:
-        return _PHYSICAL_PROPERTY_SEMANTIC
-
-    if "partition" in key or key in {"ttl", "retention", "retention_period"}:
-        return _PHYSICAL_PROPERTY_SEMANTIC
-
-    if key in {
-        "distributed_by",
-        "distribution",
-        "distribution_key",
-        "bucket",
-        "buckets",
-        "bucket_count",
-        "cluster",
-        "cluster_by",
-        "clustered_by",
-        "sort_key",
-        "order_by",
-        "compression",
-        "codec",
-        "replication_num",
-        "replication",
-        "storage_policy",
-        "bloom_filter_columns",
-        "bloom_filter",
-        "index",
-    }:
-        return _PHYSICAL_PROPERTY_LAYOUT
-
-    return _PHYSICAL_PROPERTY_UNKNOWN
-
-
 def _external_model_directly_modified_output_columns(
     new: Snapshot,
     old: Snapshot,
@@ -1263,10 +1198,6 @@ def _external_model_directly_modified_output_columns(
         affected_columns.update(_normalize_column_name(column) for column in new_columns_to_types)
 
     return affected_columns
-
-
-def _normalize_physical_property_key(key: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
 
 
 def _projection_map(

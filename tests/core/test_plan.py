@@ -2906,6 +2906,60 @@ def test_semantic_physical_property_change_propagates_to_all_downstream(
     assert updated_snapshot_c.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
 
 
+def test_semantic_physical_property_change_forces_same_version_rebuild(make_snapshot):
+    snapshot_a = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select cast('2023-01-01' as date) as ds, 1 as store_id, 2 as goods_id"),
+            kind=dict(name=ModelKindName.INCREMENTAL_BY_PARTITION),
+            dialect="doris",
+            partitioned_by=[parse_one("ds")],
+            physical_properties=d.parse_one("(unique_key = (ds, store_id))"),
+        )
+    )
+    snapshot_a.version = snapshot_a.version_get_or_generate()
+    snapshot_a.intervals = [(to_timestamp("2023-01-01"), to_timestamp("2023-01-02"))]
+
+    live_model_a = snapshot_a.model.copy(
+        update={
+            "physical_properties_": d.parse_one("(unique_key = (ds, store_id, goods_id))"),
+        }
+    )
+    live_model_a.__dict__.pop("physical_properties", None)
+    live_snapshot_a = snapshot_a.copy(update={"node": live_model_a})
+    live_snapshot_a.categorize_as(SnapshotChangeCategory.BREAKING)
+    live_snapshot_a.version = snapshot_a.version
+
+    context_diff = ContextDiff(
+        environment="test_environment",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={snapshot_a.name: (snapshot_a, live_snapshot_a)},
+        snapshots={snapshot_a.snapshot_id: snapshot_a},
+        new_snapshots={snapshot_a.snapshot_id: snapshot_a},
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+        environment_statements=[],
+    )
+
+    plan = PlanBuilder(context_diff).build()
+
+    assert snapshot_a.intervals == []
+    assert snapshot_a.change_category == SnapshotChangeCategory.BREAKING
+    assert plan.directly_modified == {snapshot_a.snapshot_id}
+    assert plan.to_evaluatable().snapshots_requiring_physical_recreation == {
+        snapshot_a.snapshot_id
+    }
+
+
 def test_layout_physical_property_change_does_not_propagate_downstream(make_snapshot):
     snapshot_a = make_snapshot(
         SqlModel(

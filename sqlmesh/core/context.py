@@ -163,6 +163,66 @@ if t.TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_DORIS_KEY_PROPERTIES = ("unique_key", "duplicate_key", "aggregate_key")
+
+
+def _physical_properties_tuple(
+    physical_properties: t.Dict[str, exp.Expression],
+) -> exp.Tuple:
+    return exp.Tuple(
+        expressions=[
+            exp.EQ(this=exp.column(key), expression=value)
+            for key, value in physical_properties.items()
+        ]
+    )
+
+
+def _physical_key_property(
+    physical_properties: t.Dict[str, exp.Expression],
+) -> t.Optional[t.Tuple[str, exp.Expression]]:
+    normalized_properties = {
+        key.lower(): (key, value) for key, value in physical_properties.items()
+    }
+    for key in _DORIS_KEY_PROPERTIES:
+        if key in normalized_properties:
+            return normalized_properties[key]
+    return None
+
+
+def _key_property_signature(key_property: t.Tuple[str, exp.Expression]) -> t.Tuple[str, t.Tuple[str, ...]]:
+    key_name, key_value = key_property
+    return key_name.lower(), tuple(_key_property_columns(key_value))
+
+
+def _key_property_columns(expression: exp.Expression) -> t.List[str]:
+    expressions = expression.expressions if isinstance(expression, exp.Tuple) else [expression]
+    return [_key_property_column_name(expr) for expr in expressions]
+
+
+def _key_property_column_name(expression: exp.Expression) -> str:
+    if isinstance(expression, exp.Column):
+        return expression.name.lower()
+    if isinstance(expression, exp.Identifier):
+        return expression.name.lower()
+    if isinstance(expression, exp.Literal):
+        return str(expression.this).lower()
+    return expression.sql(dialect="doris").strip("`").lower()
+
+
+def _snapshot_with_physical_key_property(
+    snapshot: Snapshot, key_name: str, key_value: exp.Expression
+) -> Snapshot:
+    physical_properties = dict(snapshot.model.physical_properties)
+    for property_name in _DORIS_KEY_PROPERTIES:
+        physical_properties.pop(property_name, None)
+    physical_properties[key_name] = key_value
+
+    live_model = snapshot.model.copy(
+        update={"physical_properties_": _physical_properties_tuple(physical_properties)}
+    )
+    live_model.__dict__.pop("physical_properties", None)
+    return snapshot.copy(update={"node": live_model})
+
 
 class BaseContext(abc.ABC):
     """The base context which defines methods to execute a model."""
@@ -2860,7 +2920,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         if force_no_diff:
             return ContextDiff.create_no_diff(environment, self.state_reader)
 
-        return ContextDiff.create(
+        context_diff = ContextDiff.create(
             environment,
             snapshots=snapshots or self.snapshots,
             create_from=create_from or c.PROD,
@@ -2874,6 +2934,61 @@ class GenericContext(BaseContext, t.Generic[C]):
             infer_python_dependencies=self.config.infer_python_dependencies,
             always_recreate_environment=always_recreate_environment,
         )
+        self._inject_semantic_physical_drift(context_diff, snapshots or self.snapshots)
+        return context_diff
+
+    def _inject_semantic_physical_drift(
+        self, context_diff: ContextDiff, snapshots: t.Dict[str, Snapshot]
+    ) -> None:
+        for local_snapshot in snapshots.values():
+            if local_snapshot.snapshot_id in context_diff.added:
+                continue
+
+            modified_snapshot = context_diff.modified_snapshots.get(local_snapshot.name)
+            current_snapshot = (
+                modified_snapshot[0]
+                if modified_snapshot
+                else context_diff.snapshots.get(local_snapshot.snapshot_id, local_snapshot)
+            )
+            live_snapshot = modified_snapshot[1] if modified_snapshot else current_snapshot
+
+            if not current_snapshot.is_model or current_snapshot.model.dialect != "doris":
+                continue
+            if not current_snapshot.model.kind.is_materialized:
+                continue
+
+            adapter = self.engine_adapters.get(current_snapshot.model.gateway, self.engine_adapter)
+            get_live_semantic_key_property = getattr(
+                adapter, "get_live_semantic_key_property", None
+            )
+            if not callable(get_live_semantic_key_property):
+                continue
+
+            live_key_property = get_live_semantic_key_property(
+                live_snapshot._table_name(
+                    live_snapshot.version_get_or_generate(), is_deployable=True
+                )
+            )
+            if not live_key_property:
+                continue
+
+            current_key_property = _physical_key_property(current_snapshot.model.physical_properties)
+            if current_key_property and _key_property_signature(
+                current_key_property
+            ) == _key_property_signature(live_key_property):
+                continue
+
+            live_key_name, live_key_value = live_key_property
+            live_previous_snapshot = _snapshot_with_physical_key_property(
+                live_snapshot, live_key_name, live_key_value
+            )
+
+            context_diff.modified_snapshots[current_snapshot.name] = (
+                current_snapshot,
+                live_previous_snapshot,
+            )
+            context_diff.snapshots[current_snapshot.snapshot_id] = current_snapshot
+            context_diff.new_snapshots[current_snapshot.snapshot_id] = current_snapshot
 
     def _destroy(self) -> bool:
         # Invalidate all environments, including prod

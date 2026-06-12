@@ -11,6 +11,7 @@ from sqlmesh.core.context_diff import ContextDiff
 from sqlmesh.core.environment import Environment, EnvironmentNamingInfo, EnvironmentStatements
 from sqlmesh.utils.metaprogramming import Executable  # noqa
 from sqlmesh.core.node import IntervalUnit
+from sqlmesh.core.plan.common import requires_physical_recreation
 from sqlmesh.core.snapshot import (
     DeployabilityIndex,
     Intervals,
@@ -286,6 +287,11 @@ class Plan(PydanticModel, frozen=True):
             },
             metadata_updated_snapshots=sorted(self.metadata_updated),
             removed_snapshots=sorted(self.context_diff.removed_snapshots),
+            snapshots_requiring_physical_recreation={
+                new.snapshot_id
+                for new, old in self.context_diff.modified_snapshots.values()
+                if requires_physical_recreation(old, new)
+            },
             requires_backfill=self.requires_backfill,
             models_to_backfill=self.models_to_backfill,
             start_override_per_model=self.start_override_per_model,
@@ -329,6 +335,7 @@ class EvaluatablePlan(PydanticModel):
     indirectly_modified_snapshots: t.Dict[str, t.List[SnapshotId]]
     metadata_updated_snapshots: t.List[SnapshotId]
     removed_snapshots: t.List[SnapshotId]
+    snapshots_requiring_physical_recreation: t.Set[SnapshotId] = Field(default_factory=set)
     requires_backfill: bool
     models_to_backfill: t.Optional[t.Set[str]] = None
     start_override_per_model: t.Optional[t.Dict[str, datetime]] = None

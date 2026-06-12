@@ -129,6 +129,47 @@ def test_create_table_like(make_mocked_engine_adapter: t.Callable[..., DorisEngi
     ]
 
 
+@pytest.mark.parametrize(
+    ("show_create_sql", "expected_key", "expected_value_sql"),
+    [
+        (
+            "CREATE TABLE `test_table` (`id` INT) UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10",
+            "unique_key",
+            "id",
+        ),
+        (
+            "CREATE TABLE `test_table` (`id` INT) DUPLICATE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10",
+            "duplicate_key",
+            "id",
+        ),
+        (
+            "CREATE TABLE `test_table` (`id` INT, `ds` DATE) UNIQUE KEY (`id`, `ds`) DISTRIBUTED BY HASH (`id`) BUCKETS 10",
+            "unique_key",
+            "(id, ds)",
+        ),
+        (
+            "CREATE TABLE `test_table` (`id` INT, `ds` DATE) AGGREGATE KEY (`id`, `ds`) DISTRIBUTED BY HASH (`id`) BUCKETS 10",
+            "aggregate_key",
+            "(id, ds)",
+        ),
+    ],
+)
+def test_get_live_semantic_key_property(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+    mocker: MockerFixture,
+    show_create_sql: str,
+    expected_key: str,
+    expected_value_sql: str,
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    mocker.patch.object(adapter, "fetchone", return_value=(None, show_create_sql))
+
+    assert adapter.get_live_semantic_key_property("test_table") == (
+        expected_key,
+        parse_one(expected_value_sql, dialect="doris") if expected_value_sql != "id" else exp.column("id"),
+    )
+
+
 def test_create_schema(make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter]):
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
     adapter.create_schema("test_schema")

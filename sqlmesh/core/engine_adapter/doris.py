@@ -43,6 +43,16 @@ if t.TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+_DORIS_KEY_PROPERTY_PATTERN = re.compile(
+    r"\b(?P<kind>UNIQUE|DUPLICATE|AGGREGATE)\s+KEY\s*\((?P<columns>[^)]*)\)",
+    re.IGNORECASE | re.DOTALL,
+)
+_DORIS_KEY_PROPERTY_NAMES = {
+    "UNIQUE": "unique_key",
+    "DUPLICATE": "duplicate_key",
+    "AGGREGATE": "aggregate_key",
+}
+
 
 @set_catalog()
 class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, NonTransactionalTruncateMixin):
@@ -198,6 +208,69 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
             source_columns=source_columns,
             **create_kwargs,
         )
+
+    def get_live_semantic_key_property(
+        self, table_name: TableName
+    ) -> t.Optional[t.Tuple[str, exp.Expression]]:
+        """Returns the live Doris key property from SHOW CREATE TABLE.
+
+        The return value is a `(property_name, property_value)` tuple where `property_name`
+        is `unique_key`, `duplicate_key`, or `aggregate_key`.
+        """
+        table = exp.to_table(table_name)
+        table_sql = table.sql(dialect=self.dialect, identify=True)
+
+        try:
+            create_sql = self.fetchone(f"SHOW CREATE TABLE {table_sql}")[1]
+        except Exception:
+            logger.debug("SHOW CREATE TABLE failed for %s", table_name, exc_info=True)
+            return None
+
+        if not create_sql:
+            return None
+
+        try:
+            create_exp = parse_one(create_sql, dialect=self.dialect)
+        except Exception:
+            logger.debug("Failed to parse SHOW CREATE TABLE for %s", table_name, exc_info=True)
+            return self._parse_key_property_from_create_sql(create_sql)
+
+        properties = create_exp.args.get("properties")
+        if not isinstance(properties, exp.Properties):
+            return self._parse_key_property_from_create_sql(create_sql)
+
+        for prop in properties.expressions:
+            if isinstance(prop, exp.UniqueKeyProperty):
+                return "unique_key", self._key_property_value(prop.expressions)
+            if isinstance(prop, exp.DuplicateKeyProperty):
+                return "duplicate_key", self._key_property_value(prop.expressions)
+
+        return self._parse_key_property_from_create_sql(create_sql)
+
+    def _parse_key_property_from_create_sql(
+        self, create_sql: str
+    ) -> t.Optional[t.Tuple[str, exp.Expression]]:
+        match = _DORIS_KEY_PROPERTY_PATTERN.search(create_sql)
+        if not match:
+            return None
+
+        key_name = _DORIS_KEY_PROPERTY_NAMES[match.group("kind").upper()]
+        columns_sql = match.group("columns")
+        try:
+            expressions = parse_one(f"SELECT {columns_sql}", dialect=self.dialect).expressions
+        except Exception:
+            logger.debug("Failed to parse Doris key columns from SHOW CREATE TABLE", exc_info=True)
+            return None
+        return key_name, self._key_property_value(expressions)
+
+    @staticmethod
+    def _key_property_value(expressions: t.Iterable[exp.Expression]) -> exp.Expression:
+        columns = [exp.to_column(getattr(expr, "name", str(expr))) for expr in expressions]
+        if not columns:
+            return exp.Tuple()
+        if len(columns) == 1:
+            return columns[0]
+        return exp.Tuple(expressions=columns)
 
     def _create_materialized_view(
         self,

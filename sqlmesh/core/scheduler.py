@@ -432,6 +432,7 @@ class Scheduler:
         selected_models: t.Optional[t.Set[str]] = None,
         allow_additive_snapshots: t.Optional[t.Set[str]] = None,
         selected_snapshot_ids: t.Optional[t.Set[SnapshotId]] = None,
+        snapshots_to_recreate: t.Optional[t.Set[SnapshotId]] = None,
         run_environment_statements: bool = False,
         audit_only: bool = False,
         auto_restatement_triggers: t.Dict[SnapshotId, t.List[SnapshotId]] = {},
@@ -450,11 +451,13 @@ class Scheduler:
             allow_destructive_snapshots: Snapshots for which destructive schema changes are allowed.
             allow_additive_snapshots: Snapshots for which additive schema changes are allowed.
             selected_snapshot_ids: The snapshots to include in the run DAG. If None, all snapshots with missing intervals will be included.
+            snapshots_to_recreate: Snapshots whose physical tables should be recreated before evaluation.
 
         Returns:
             A tuple of errors and skipped intervals.
         """
         execution_time = execution_time or now_timestamp()
+        snapshots_to_recreate = snapshots_to_recreate or set()
 
         selected_snapshots = [self.snapshots[sid] for sid in (selected_snapshot_ids or set())]
         if not selected_snapshots:
@@ -509,7 +512,9 @@ class Scheduler:
         snapshots_to_create = {
             s.snapshot_id
             for s in self.snapshot_evaluator.get_snapshots_to_create(
-                snapshots_to_create_candidates, deployability_index
+                snapshots_to_create_candidates,
+                deployability_index,
+                snapshots_to_recreate=snapshots_to_recreate,
             )
         }
 
@@ -595,6 +600,7 @@ class Scheduler:
                     allow_destructive_snapshots=allow_destructive_snapshots or set(),
                     allow_additive_snapshots=allow_additive_snapshots or set(),
                     dev_table_intervals=batched_intervals.get(snapshot),
+                    force_recreate=snapshot.snapshot_id in snapshots_to_recreate,
                 )
 
         try:

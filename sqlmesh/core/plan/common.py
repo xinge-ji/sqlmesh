@@ -1,7 +1,10 @@
 from __future__ import annotations
 import typing as t
 import logging
+import re
 from dataclasses import dataclass, field
+
+from sqlglot.optimizer.simplify import gen
 
 from sqlmesh.core.state_sync import StateReader
 from sqlmesh.core.snapshot import Snapshot, SnapshotId, SnapshotIdAndVersion, SnapshotNameVersion
@@ -23,6 +26,11 @@ def should_force_rebuild(old: Snapshot, new: Snapshot) -> bool:
     ):
         # Seed models always need to be rebuilt to reflect changes in the seed file
         # Unless only their metadata has been updated (eg description added) and the seed file has not been touched
+        return True
+    if _physical_property_change_category(new, old) in {
+        _PHYSICAL_PROPERTY_SEMANTIC,
+        _PHYSICAL_PROPERTY_UNKNOWN,
+    }:
         return True
     return is_breaking_kind_change(old, new)
 
@@ -48,6 +56,105 @@ def is_breaking_kind_change(old: Snapshot, new: Snapshot) -> bool:
         # If the partitioning hasn't changed, then we don't need to rebuild
         return False
     return True
+
+
+_PHYSICAL_PROPERTY_NONE = "none"
+_PHYSICAL_PROPERTY_SEMANTIC = "semantic"
+_PHYSICAL_PROPERTY_LAYOUT = "layout"
+_PHYSICAL_PROPERTY_UNKNOWN = "unknown"
+_DORIS_PHYSICAL_RECREATION_PROPERTIES = {
+    "unique_key",
+    "duplicate_key",
+    "aggregate_key",
+}
+
+
+def requires_physical_recreation(old: Snapshot, new: Snapshot) -> bool:
+    """Returns whether a physical property change requires a new physical table."""
+    if not new.is_model or not old.is_model:
+        return False
+    if new.model.dialect != "doris" or old.model.dialect != "doris":
+        return False
+    if not new.model.kind.is_materialized:
+        return False
+    return bool(_changed_physical_properties(new, old) & _DORIS_PHYSICAL_RECREATION_PROPERTIES)
+
+
+def _physical_property_change_category(new: Snapshot, old: Snapshot) -> str:
+    changed_properties = _changed_physical_properties(new, old)
+    if not changed_properties:
+        return _PHYSICAL_PROPERTY_NONE
+
+    categories = {_physical_property_category(key) for key in changed_properties}
+    if _PHYSICAL_PROPERTY_SEMANTIC in categories:
+        return _PHYSICAL_PROPERTY_SEMANTIC
+    if _PHYSICAL_PROPERTY_UNKNOWN in categories:
+        return _PHYSICAL_PROPERTY_UNKNOWN
+    return _PHYSICAL_PROPERTY_LAYOUT
+
+
+def _serialized_physical_properties(snapshot: Snapshot) -> t.Dict[str, str]:
+    return {
+        _normalize_physical_property_key(key): gen(value)
+        for key, value in snapshot.model.physical_properties.items()
+    }
+
+
+def _changed_physical_properties(new: Snapshot, old: Snapshot) -> t.Set[str]:
+    old_properties = _serialized_physical_properties(old)
+    new_properties = _serialized_physical_properties(new)
+    return {
+        key
+        for key in old_properties.keys() | new_properties.keys()
+        if old_properties.get(key) != new_properties.get(key)
+    }
+
+
+def _physical_property_category(key: str) -> str:
+    if key in {
+        "unique_key",
+        "primary_key",
+        "aggregate_key",
+        "duplicate_key",
+        "merge_key",
+        "replace_key",
+        "replacing_key",
+        "deduplicate_key",
+        "key",
+    }:
+        return _PHYSICAL_PROPERTY_SEMANTIC
+
+    if "partition" in key or key in {"ttl", "retention", "retention_period"}:
+        return _PHYSICAL_PROPERTY_SEMANTIC
+
+    if key in {
+        "distributed_by",
+        "distribution",
+        "distribution_key",
+        "bucket",
+        "buckets",
+        "bucket_count",
+        "cluster",
+        "cluster_by",
+        "clustered_by",
+        "sort_key",
+        "order_by",
+        "compression",
+        "codec",
+        "replication_num",
+        "replication",
+        "storage_policy",
+        "bloom_filter_columns",
+        "bloom_filter",
+        "index",
+    }:
+        return _PHYSICAL_PROPERTY_LAYOUT
+
+    return _PHYSICAL_PROPERTY_UNKNOWN
+
+
+def _normalize_physical_property_key(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
 
 
 @dataclass

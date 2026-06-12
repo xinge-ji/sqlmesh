@@ -369,6 +369,7 @@ class SnapshotEvaluator:
         allow_destructive_snapshots: t.Optional[t.Set[str]] = None,
         allow_additive_snapshots: t.Optional[t.Set[str]] = None,
         dev_table_intervals: t.Optional[t.Dict[Snapshot, Intervals]] = None,
+        snapshots_to_recreate: t.Optional[t.Set[SnapshotId]] = None,
     ) -> CompletionStatus:
         """Creates a physical snapshot schema and table for the given collection of snapshots.
 
@@ -381,13 +382,19 @@ class SnapshotEvaluator:
             allow_destructive_snapshots: Set of snapshots that are allowed to have destructive schema changes.
             allow_additive_snapshots: Set of snapshots that are allowed to have additive schema changes.
             dev_table_intervals: Intervals to use for dev-only physical table layout optimizations.
+            snapshots_to_recreate: Snapshots whose physical tables should be recreated.
 
         Returns:
             CompletionStatus: The status of the creation operation (success, failure, nothing to do).
         """
         deployability_index = deployability_index or DeployabilityIndex.all_deployable()
+        snapshots_to_recreate = snapshots_to_recreate or set()
 
-        snapshots_to_create = self.get_snapshots_to_create(target_snapshots, deployability_index)
+        snapshots_to_create = self.get_snapshots_to_create(
+            target_snapshots,
+            deployability_index,
+            snapshots_to_recreate=snapshots_to_recreate,
+        )
         if not snapshots_to_create:
             return CompletionStatus.NOTHING_TO_DO
         if on_start:
@@ -401,6 +408,7 @@ class SnapshotEvaluator:
             allow_destructive_snapshots=allow_destructive_snapshots or set(),
             allow_additive_snapshots=allow_additive_snapshots or set(),
             dev_table_intervals=dev_table_intervals or {},
+            snapshots_to_recreate=snapshots_to_recreate,
         )
         return CompletionStatus.SUCCESS
 
@@ -426,14 +434,19 @@ class SnapshotEvaluator:
         self._create_schemas(gateway_table_pairs=gateway_table_pairs)
 
     def get_snapshots_to_create(
-        self, target_snapshots: t.Iterable[Snapshot], deployability_index: DeployabilityIndex
+        self,
+        target_snapshots: t.Iterable[Snapshot],
+        deployability_index: DeployabilityIndex,
+        snapshots_to_recreate: t.Optional[t.Set[SnapshotId]] = None,
     ) -> t.List[Snapshot]:
         """Returns a list of snapshots that need to have their physical tables created.
 
         Args:
             target_snapshots: Target snapshots.
             deployability_index: Determines snapshots that are deployable / representative in the context of this creation.
+            snapshots_to_recreate: Snapshots whose physical tables should be recreated.
         """
+        snapshots_to_recreate = snapshots_to_recreate or set()
         existing_data_objects = self._get_physical_data_objects(
             target_snapshots, deployability_index
         )
@@ -441,8 +454,10 @@ class SnapshotEvaluator:
         for snapshot in target_snapshots:
             if not snapshot.is_model or snapshot.is_symbolic:
                 continue
-            if snapshot.snapshot_id not in existing_data_objects or (
-                snapshot.is_seed and not snapshot.intervals
+            if (
+                snapshot.snapshot_id in snapshots_to_recreate
+                or snapshot.snapshot_id not in existing_data_objects
+                or (snapshot.is_seed and not snapshot.intervals)
             ):
                 snapshots_to_create.append(snapshot)
 
@@ -457,6 +472,7 @@ class SnapshotEvaluator:
         allow_destructive_snapshots: t.Set[str],
         allow_additive_snapshots: t.Set[str],
         dev_table_intervals: t.Dict[Snapshot, Intervals],
+        snapshots_to_recreate: t.Set[SnapshotId],
     ) -> None:
         """Internal method to create tables in parallel."""
         with self.concurrent_context():
@@ -469,6 +485,7 @@ class SnapshotEvaluator:
                     allow_destructive_snapshots=allow_destructive_snapshots,
                     allow_additive_snapshots=allow_additive_snapshots,
                     dev_table_intervals=dev_table_intervals.get(s),
+                    force_recreate=s.snapshot_id in snapshots_to_recreate,
                     on_complete=on_complete,
                 ),
                 self.ddl_concurrent_tasks,
@@ -873,6 +890,7 @@ class SnapshotEvaluator:
         allow_additive_snapshots: t.Set[str],
         dev_table_intervals: t.Optional[Intervals] = None,
         on_complete: t.Optional[t.Callable[[SnapshotInfoLike], None]] = None,
+        force_recreate: bool = False,
     ) -> None:
         """Creates a physical table for the given snapshot.
 
@@ -883,6 +901,7 @@ class SnapshotEvaluator:
             on_complete: A callback to call on each successfully created database object.
             allow_destructive_snapshots: Snapshots for which destructive schema changes are allowed.
             allow_additive_snapshots: Snapshots for which additive schema changes are allowed.
+            force_recreate: Whether to drop and recreate the target physical table.
         """
         if not snapshot.is_model:
             return
@@ -924,9 +943,12 @@ class SnapshotEvaluator:
                 )
             else:
                 is_table_deployable = deployability_index.is_deployable(snapshot)
+                table_name = snapshot.table_name(is_deployable=is_table_deployable)
+                if force_recreate:
+                    adapter.drop_table(table_name)
                 self._execute_create(
                     snapshot=snapshot,
-                    table_name=snapshot.table_name(is_deployable=is_table_deployable),
+                    table_name=table_name,
                     is_table_deployable=is_table_deployable,
                     deployability_index=deployability_index,
                     create_render_kwargs=create_render_kwargs,

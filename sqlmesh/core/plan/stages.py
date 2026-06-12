@@ -65,6 +65,7 @@ class PhysicalLayerUpdateStage:
         all_snapshots: All snapshots in the plan by snapshot ID.
         snapshot_to_intervals: Missing intervals computed for snapshots in the plan.
         snapshots_with_missing_intervals: Snapshots that have missing intervals.
+        snapshots_to_recreate: Snapshots whose physical tables should be recreated.
         deployability_index: Deployability index for this stage.
     """
 
@@ -72,6 +73,7 @@ class PhysicalLayerUpdateStage:
     all_snapshots: t.Dict[SnapshotId, Snapshot]
     snapshot_to_intervals: SnapshotToIntervals
     snapshots_with_missing_intervals: t.Set[SnapshotId]
+    snapshots_to_recreate: t.Set[SnapshotId]
     deployability_index: DeployabilityIndex
 
 
@@ -127,6 +129,7 @@ class BackfillStage:
         selected_snapshot_ids: The snapshots to include in the run DAG.
         all_snapshots: All snapshots in the plan by name.
         deployability_index: Deployability index for this stage.
+        snapshots_to_recreate: Snapshots whose physical tables should be recreated.
         before_promote: Whether this stage is before the promotion stage.
     """
 
@@ -134,6 +137,7 @@ class BackfillStage:
     selected_snapshot_ids: t.Set[SnapshotId]
     all_snapshots: t.Dict[str, Snapshot]
     deployability_index: DeployabilityIndex
+    snapshots_to_recreate: t.Set[SnapshotId]
     before_promote: bool = True
 
 
@@ -250,7 +254,7 @@ class PlanStagesBuilder:
         """
         new_snapshots = {s.snapshot_id: s for s in plan.new_snapshots}
         stored_snapshots = self.state_reader.get_snapshots(plan.environment.snapshots)
-        snapshots = {**new_snapshots, **stored_snapshots}
+        snapshots = {**stored_snapshots, **new_snapshots}
         snapshots_by_name = {s.name: s for s in snapshots.values()}
         dag = snapshots_to_dag(snapshots.values())
 
@@ -279,12 +283,18 @@ class PlanStagesBuilder:
             snapshot_ids_with_schema_migration = [
                 s.snapshot_id for s in snapshots.values() if s.requires_schema_migration_in_prod
             ]
+            snapshot_ids_with_schema_migration = [
+                s_id
+                for s_id in snapshot_ids_with_schema_migration
+                if s_id not in plan.snapshots_requiring_physical_recreation
+            ]
             # Include all upstream dependencies of snapshots that require schema migration to make sure
             # the upstream tables are created before the schema updates are applied
             snapshots_with_schema_migration = [
                 snapshots[s_id]
                 for s_id in dag.subdag(*snapshot_ids_with_schema_migration)
-                if snapshots[s_id].supports_schema_migration_in_prod
+                if s_id not in plan.snapshots_requiring_physical_recreation
+                and snapshots[s_id].supports_schema_migration_in_prod
             ]
 
         snapshots_to_intervals = self._missing_intervals(
@@ -348,6 +358,7 @@ class PlanStagesBuilder:
                     },
                     all_snapshots=snapshots_by_name,
                     deployability_index=deployability_index,
+                    snapshots_to_recreate=plan.snapshots_requiring_physical_recreation,
                 )
             )
         elif not needs_backfill:
@@ -358,6 +369,7 @@ class PlanStagesBuilder:
                     selected_snapshot_ids=set(),
                     all_snapshots=snapshots_by_name,
                     deployability_index=deployability_index,
+                    snapshots_to_recreate=set(),
                 )
             )
 
@@ -402,6 +414,7 @@ class PlanStagesBuilder:
                     },
                     all_snapshots=snapshots_by_name,
                     deployability_index=deployability_index,
+                    snapshots_to_recreate=plan.snapshots_requiring_physical_recreation,
                 )
             )
 
@@ -494,6 +507,7 @@ class PlanStagesBuilder:
                 for s in snapshots_to_intervals
                 if plan.is_selected_for_backfill(s.name)
             },
+            snapshots_to_recreate=plan.snapshots_requiring_physical_recreation,
             deployability_index=deployability_index,
         )
 
@@ -660,6 +674,9 @@ class PlanStagesBuilder:
     ) -> None:
         # Make sure the intervals are up to date and restatements are reflected
         self.state_reader.refresh_snapshot_intervals(snapshots_by_name.values())
+        for snapshot in snapshots_by_name.values():
+            if snapshot.snapshot_id in plan.snapshots_requiring_physical_recreation:
+                snapshot.intervals = []
 
         if not existing_environment:
             existing_environment = self.state_reader.get_environment(c.PROD)
