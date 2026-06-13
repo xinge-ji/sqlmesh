@@ -195,6 +195,8 @@ def _key_property_signature(key_property: t.Tuple[str, exp.Expression]) -> t.Tup
 
 
 def _key_property_columns(expression: exp.Expression) -> t.List[str]:
+    if isinstance(expression, exp.Paren):
+        return _key_property_columns(expression.this)
     expressions = expression.expressions if isinstance(expression, exp.Tuple) else [expression]
     return [_key_property_column_name(expr) for expr in expressions]
 
@@ -222,6 +224,14 @@ def _snapshot_with_physical_key_property(
     )
     live_model.__dict__.pop("physical_properties", None)
     return snapshot.copy(update={"node": live_model})
+
+
+def _is_doris_default_duplicate_key(
+    current_key_property: t.Optional[t.Tuple[str, exp.Expression]],
+    live_key_property: t.Tuple[str, exp.Expression],
+) -> bool:
+    """Doris renders Duplicate Key for default tables even when no key was configured."""
+    return current_key_property is None and live_key_property[0].lower() == "duplicate_key"
 
 
 class BaseContext(abc.ABC):
@@ -2964,15 +2974,24 @@ class GenericContext(BaseContext, t.Generic[C]):
             if not callable(get_live_semantic_key_property):
                 continue
 
-            live_key_property = get_live_semantic_key_property(
-                live_snapshot._table_name(
+            environment_snapshot_info = context_diff.environment_snapshots_by_name.get(
+                current_snapshot.name
+            )
+            live_table_name = (
+                environment_snapshot_info.table_name()
+                if environment_snapshot_info
+                else live_snapshot._table_name(
                     live_snapshot.version_get_or_generate(), is_deployable=True
                 )
             )
+            live_key_property = get_live_semantic_key_property(live_table_name)
             if not live_key_property:
                 continue
 
             current_key_property = _physical_key_property(current_snapshot.model.physical_properties)
+            if _is_doris_default_duplicate_key(current_key_property, live_key_property):
+                continue
+
             if current_key_property and _key_property_signature(
                 current_key_property
             ) == _key_property_signature(live_key_property):

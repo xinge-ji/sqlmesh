@@ -1069,6 +1069,50 @@ def test_run_merged_intervals_force_recreate_snapshot(mocker: MockerFixture, mak
     assert mock_snapshot_evaluator.create_snapshot.call_args.kwargs["force_recreate"]
 
 
+def test_run_merged_intervals_force_recreate_evaluate_node_snapshot(
+    mocker: MockerFixture, make_snapshot
+):
+    snapshot = make_snapshot(
+        SqlModel(
+            name="test.model_items",
+            query=parse_one("SELECT id FROM raw.items"),
+        )
+    )
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+
+    mock_snapshot_evaluator = mocker.MagicMock()
+    mock_snapshot_evaluator.get_snapshots_to_create.return_value = [snapshot]
+    mock_snapshot_evaluator.concurrent_context.return_value.__enter__.return_value = None
+    mock_snapshot_evaluator.concurrent_context.return_value.__exit__.return_value = None
+    mock_snapshot_evaluator.evaluate.return_value = None
+    mock_snapshot_evaluator.execution_tracker.get_execution_stats.return_value = None
+
+    scheduler = Scheduler(
+        snapshots=[snapshot],
+        snapshot_evaluator=mock_snapshot_evaluator,
+        state_sync=mocker.MagicMock(),
+        default_catalog=None,
+        max_workers=1,
+    )
+    merged_intervals = {
+        snapshot: [
+            (to_timestamp("2023-01-01"), to_timestamp("2023-01-02")),
+        ],
+    }
+    deployability_index = DeployabilityIndex.create([snapshot])
+
+    scheduler.run_merged_intervals(
+        merged_intervals=merged_intervals,
+        deployability_index=deployability_index,
+        environment_naming_info=EnvironmentNamingInfo(name="test_env"),
+        snapshots_to_recreate={snapshot.snapshot_id},
+    )
+
+    mock_snapshot_evaluator.create_snapshot.assert_not_called()
+    mock_snapshot_evaluator.evaluate.assert_called_once()
+    assert mock_snapshot_evaluator.evaluate.call_args.kwargs["target_table_exists"] is False
+
+
 def test_dag_transitive_deps(mocker: MockerFixture, make_snapshot):
     # Create a simple dependency chain: A <- B <- C
     snapshot_a = make_snapshot(SqlModel(name="a", query=parse_one("SELECT 1 as id")))

@@ -54,6 +54,27 @@ _DORIS_KEY_PROPERTY_NAMES = {
 }
 
 
+def _doris_key_columns(key: t.Any) -> t.List[exp.Column]:
+    if isinstance(key, exp.Paren):
+        return _doris_key_columns(key.this)
+    if isinstance(key, exp.Tuple):
+        columns = []
+        for expression in key.expressions:
+            columns.extend(_doris_key_columns(expression))
+        return columns
+    if isinstance(key, exp.Column):
+        return [key]
+    if isinstance(key, exp.Literal):
+        return [exp.to_column(key.this)]
+    if isinstance(key, str):
+        return [exp.to_column(key)]
+    return [exp.to_column(str(key))]
+
+
+def _doris_key_column_names(key: t.Any) -> t.Set[str]:
+    return {column.name for column in _doris_key_columns(key)}
+
+
 @set_catalog()
 class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, NonTransactionalTruncateMixin):
     DIALECT = "doris"
@@ -929,84 +950,16 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
                     )
                 )
 
-        # Handle unique_key - only handle Tuple expressions or single Column expressions
+        # Handle unique_key
         unique_key = table_properties_copy.pop("unique_key", None)
         if unique_key is not None:
-            # For materialized views, KEY is rendered inline as UniqueKeyProperty, not skipped
-            if not is_materialized_view:
-                if isinstance(unique_key, exp.Tuple):
-                    # Extract column names from Tuple expressions
-                    column_names = []
-                    for expr in unique_key.expressions:
-                        if isinstance(expr, exp.Column) and hasattr(expr, "this") and hasattr(expr.this, "this"):
-                            column_names.append(str(expr.this.this))
-                        elif hasattr(expr, "this"):
-                            column_names.append(str(expr.this))
-                        else:
-                            column_names.append(str(expr))
-                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(k) for k in column_names]))
-                elif isinstance(unique_key, exp.Column):
-                    # Handle as single column
-                    if hasattr(unique_key, "this") and hasattr(unique_key.this, "this"):
-                        column_name = str(unique_key.this.this)
-                    else:
-                        column_name = str(unique_key.this)
-                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(column_name)]))
-                elif isinstance(unique_key, exp.Literal):
-                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(unique_key.this)]))
-                elif isinstance(unique_key, str):
-                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(unique_key)]))
-            else:
-                # For materialized views, also add UniqueKeyProperty
-                if isinstance(unique_key, exp.Tuple):
-                    # Extract column names from Tuple expressions
-                    column_names = []
-                    for expr in unique_key.expressions:
-                        if isinstance(expr, exp.Column) and hasattr(expr, "this") and hasattr(expr.this, "this"):
-                            column_names.append(str(expr.this.this))
-                        elif hasattr(expr, "this"):
-                            column_names.append(str(expr.this))
-                        else:
-                            column_names.append(str(expr))
-                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(k) for k in column_names]))
-                elif isinstance(unique_key, exp.Column):
-                    # Handle as single column
-                    if hasattr(unique_key, "this") and hasattr(unique_key.this, "this"):
-                        column_name = str(unique_key.this.this)
-                    else:
-                        column_name = str(unique_key.this)
-                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(column_name)]))
-                elif isinstance(unique_key, exp.Literal):
-                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(unique_key.this)]))
-                elif isinstance(unique_key, str):
-                    properties.append(exp.UniqueKeyProperty(expressions=[exp.to_column(unique_key)]))
+            properties.append(exp.UniqueKeyProperty(expressions=_doris_key_columns(unique_key)))
 
-        # Handle duplicate_key - only handle Tuple expressions or single Column expressions
+        # Handle duplicate_key
         # Both tables and materialized views support duplicate keys in Doris
         duplicate_key = table_properties_copy.pop("duplicate_key", None)
         if duplicate_key is not None:
-            if isinstance(duplicate_key, exp.Tuple):
-                # Extract column names from Tuple expressions
-                column_names = []
-                for expr in duplicate_key.expressions:
-                    if isinstance(expr, exp.Column) and hasattr(expr, "this") and hasattr(expr.this, "this"):
-                        column_names.append(str(expr.this.this))
-                    elif hasattr(expr, "this"):
-                        column_names.append(str(expr.this))
-                    else:
-                        column_names.append(str(expr))
-                properties.append(exp.DuplicateKeyProperty(expressions=[exp.to_column(k) for k in column_names]))
-            elif isinstance(duplicate_key, exp.Column):
-                # Handle as single column
-                if hasattr(duplicate_key, "this") and hasattr(duplicate_key.this, "this"):
-                    column_name = str(duplicate_key.this.this)
-                else:
-                    column_name = str(duplicate_key.this)
-                properties.append(exp.DuplicateKeyProperty(expressions=[exp.to_column(column_name)]))
-            elif isinstance(duplicate_key, exp.Literal):
-                properties.append(exp.DuplicateKeyProperty(expressions=[exp.to_column(duplicate_key.this)]))
-            elif isinstance(duplicate_key, str):
-                properties.append(exp.DuplicateKeyProperty(expressions=[exp.to_column(duplicate_key)]))
+            properties.append(exp.DuplicateKeyProperty(expressions=_doris_key_columns(duplicate_key)))
 
         if table_description:
             properties.append(
@@ -1020,21 +973,7 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
             partitioned_by, _ = self._parse_partition_expressions(partitioned_by)
             # For tables, check if partitioned_by columns are in unique_key; for materialized views, allow regardless
             if unique_key is not None and not is_materialized_view:
-                # Extract key column names from unique_key (only Tuple or Column expressions)
-                key_cols_set = set()
-                if isinstance(unique_key, exp.Tuple):
-                    for expr in unique_key.expressions:
-                        if isinstance(expr, exp.Column) and hasattr(expr, "this") and hasattr(expr.this, "this"):
-                            key_cols_set.add(str(expr.this.this))
-                        elif hasattr(expr, "this"):
-                            key_cols_set.add(str(expr.this))
-                        else:
-                            key_cols_set.add(str(expr))
-                elif isinstance(unique_key, exp.Column):
-                    if hasattr(unique_key, "this") and hasattr(unique_key.this, "this"):
-                        key_cols_set.add(str(unique_key.this.this))
-                    else:
-                        key_cols_set.add(str(unique_key.this))
+                key_cols_set = _doris_key_column_names(unique_key)
 
                 partition_cols = set()
                 for expr in partitioned_by:

@@ -933,6 +933,45 @@ def test_promote_environment_expired(
         assert promotion_result.added == [snapshot.table_info]
 
 
+def test_promote_prod_adds_same_fingerprint_new_physical_version(
+    state_sync: EngineAdapterStateSync, make_snapshot: t.Callable
+) -> None:
+    snapshot = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1, ds"),
+        ),
+    )
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+    old_table_info = snapshot.table_info.copy(update={"version": "old_version"})
+    old_environment = Environment(
+        name="prod",
+        snapshots=[old_table_info],
+        start_at="2022-01-01",
+        end_at="2022-01-01",
+        plan_id="old_plan_id",
+        previous_plan_id=None,
+    )
+    state_sync.push_snapshots([snapshot])
+    state_sync.promote(old_environment)
+    state_sync.finalize(old_environment)
+
+    new_environment = Environment(
+        name="prod",
+        snapshots=[snapshot.table_info],
+        start_at="2022-01-01",
+        end_at="2022-01-01",
+        plan_id="new_plan_id",
+        previous_plan_id="old_plan_id",
+    )
+    promotion_result = state_sync.promote(new_environment)
+
+    assert promotion_result.added == [snapshot.table_info]
+    assert promotion_result.added[0].table_name() != old_table_info.table_name()
+    assert not promotion_result.removed
+    assert not promotion_result.removed_environment_naming_info
+
+
 def test_promote_snapshots_no_gaps(state_sync: EngineAdapterStateSync, make_snapshot: t.Callable):
     model = SqlModel(
         name="a",

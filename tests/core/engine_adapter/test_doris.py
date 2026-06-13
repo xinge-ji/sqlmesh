@@ -99,10 +99,20 @@ def test_create_table(make_mocked_engine_adapter: t.Callable[..., DorisEngineAda
         table_properties={"unique_key": exp.Column(this=exp.Identifier(this="a", quoted=True))},
     )
     adapter.create_table(
+        "test_table_paren",
+        target_columns_to_types={"a": exp.DataType.build("INT")},
+        table_properties={"unique_key": exp.Paren(this=exp.to_column("a"))},
+    )
+    adapter.create_table(
         "test_table",
         target_columns_to_types={"a": exp.DataType.build("INT")},
         column_descriptions={"a": "test_column_description"},
         table_properties={"duplicate_key": exp.Column(this=exp.Identifier(this="a", quoted=True))},
+    )
+    adapter.create_table(
+        "test_table_paren_dup",
+        target_columns_to_types={"a": exp.DataType.build("INT")},
+        table_properties={"duplicate_key": exp.Paren(this=exp.to_column("a"))},
     )
     adapter.create_table(
         "test_table",
@@ -112,7 +122,9 @@ def test_create_table(make_mocked_engine_adapter: t.Callable[..., DorisEngineAda
     )
     assert to_sql_calls(adapter) == [
         "CREATE TABLE IF NOT EXISTS `test_table` (`a` INT COMMENT 'test_column_description') UNIQUE KEY (`a`) DISTRIBUTED BY HASH (`a`) BUCKETS 10",
+        "CREATE TABLE IF NOT EXISTS `test_table_paren` (`a` INT) UNIQUE KEY (`a`) DISTRIBUTED BY HASH (`a`) BUCKETS 10",
         "CREATE TABLE IF NOT EXISTS `test_table` (`a` INT COMMENT 'test_column_description') DUPLICATE KEY (`a`)",
+        "CREATE TABLE IF NOT EXISTS `test_table_paren_dup` (`a` INT) DUPLICATE KEY (`a`)",
         "CREATE TABLE IF NOT EXISTS `test_table` (`a` INT COMMENT 'test_column_description') COMMENT 'test_description'",
     ]
 
@@ -325,6 +337,30 @@ def test_create_table_with_partitioned_by(
 
     assert to_sql_calls(adapter) == [
         "CREATE TABLE IF NOT EXISTS `test_table` (`a` INT, `b` DATE) PARTITION BY RANGE (`b`) (FROM ('2000-11-14') TO ('2021-11-14') INTERVAL 2 YEAR)",
+    ]
+
+
+def test_create_table_with_partitioned_by_and_paren_unique_key(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    adapter.create_table(
+        "test_table",
+        target_columns_to_types={
+            "ds": exp.DataType.build("DATE"),
+            "id": exp.DataType.build("INT"),
+        },
+        partitioned_by=[exp.Literal.string("RANGE(ds)")],
+        table_properties={
+            "unique_key": exp.Paren(this=exp.to_column("ds")),
+            "partitions": exp.Literal.string(
+                "FROM ('2000-01-01') TO ('2049-12-31') INTERVAL 1 MONTH"
+            ),
+        },
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `test_table` (`ds` DATE, `id` INT) UNIQUE KEY (`ds`) PARTITION BY RANGE (`ds`) (FROM ('2000-01-01') TO ('2049-12-31') INTERVAL 1 MONTH) DISTRIBUTED BY HASH (`ds`) BUCKETS 10",
     ]
 
 

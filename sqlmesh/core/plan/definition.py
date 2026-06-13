@@ -213,7 +213,9 @@ class Plan(PydanticModel, frozen=True):
         )
 
         snapshots_by_name = self.context_diff.snapshots_by_name
-        snapshots = [s.table_info for s in self.snapshots.values()]
+        snapshots = [
+            self.context_diff.environment_snapshot_table_info(s) for s in self.snapshots.values()
+        ]
         promotable_snapshot_ids = None
         if self.is_dev:
             if self.selected_models_to_backfill is not None:

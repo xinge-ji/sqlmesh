@@ -80,6 +80,8 @@ def requires_physical_recreation(old: Snapshot, new: Snapshot) -> bool:
     return bool(_changed_physical_properties(new, old) & _DORIS_PHYSICAL_RECREATION_PROPERTIES)
 
 
+
+
 def _physical_property_change_category(new: Snapshot, old: Snapshot) -> str:
     changed_properties = _changed_physical_properties(new, old)
     if not changed_properties:

@@ -180,6 +180,65 @@ def test_build_plan_stages_basic(
     assert isinstance(stages[6], FinalizeEnvironmentStage)
 
 
+def test_build_plan_stages_promotes_same_fingerprint_new_physical_version(
+    snapshot_a: Snapshot, mocker: MockerFixture
+) -> None:
+    state_reader = mocker.Mock(spec=StateReader)
+    state_reader.get_snapshots.return_value = {snapshot_a.snapshot_id: snapshot_a}
+    old_table_info = snapshot_a.table_info.copy(update={"version": "old_version"})
+    existing_environment = Environment(
+        snapshots=[old_table_info],
+        start_at="2023-01-01",
+        end_at="2023-01-02",
+        plan_id="previous_plan",
+        previous_plan_id=None,
+        finalized_ts=1,
+    )
+    state_reader.get_environment.return_value = existing_environment
+
+    environment = Environment(
+        snapshots=[snapshot_a.table_info],
+        start_at="2023-01-01",
+        end_at="2023-01-02",
+        plan_id="test_plan",
+        previous_plan_id="previous_plan",
+    )
+    plan = EvaluatablePlan(
+        start="2023-01-01",
+        end="2023-01-02",
+        new_snapshots=[],
+        environment=environment,
+        no_gaps=False,
+        skip_backfill=True,
+        empty_backfill=False,
+        restatements={},
+        restate_all_snapshots=False,
+        is_dev=False,
+        allow_destructive_models=set(),
+        allow_additive_models=set(),
+        forward_only=False,
+        end_bounded=False,
+        ensure_finalized_snapshots=False,
+        ignore_cron=False,
+        directly_modified_snapshots=[],
+        indirectly_modified_snapshots={},
+        metadata_updated_snapshots=[],
+        removed_snapshots=[],
+        requires_backfill=False,
+        models_to_backfill=None,
+        execution_time="2023-01-02",
+        disabled_restatement_models=set(),
+        environment_statements=None,
+        user_provided_flags=None,
+    )
+
+    stages = build_plan_stages(plan, state_reader, None)
+
+    virtual_stage = next(stage for stage in stages if isinstance(stage, VirtualLayerUpdateStage))
+    assert virtual_stage.promoted_snapshots == {snapshot_a.table_info}
+    assert not virtual_stage.demoted_snapshots
+
+
 def test_build_plan_stages_with_before_all_and_after_all(
     snapshot_a: Snapshot, snapshot_b: Snapshot, mocker: MockerFixture
 ) -> None:

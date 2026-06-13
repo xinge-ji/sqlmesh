@@ -219,7 +219,16 @@ class EngineAdapterStateSync(StateSync):
         added_table_infos = set(table_infos.values())
         if existing_environment and environment.can_partially_promote(existing_environment):
             # Only promote new snapshots.
-            added_table_infos -= set(existing_environment.promoted_snapshots)
+            added_table_infos = {
+                table_info
+                for table_info in table_infos.values()
+                if (
+                    table_info.name not in existing_table_infos
+                    or existing_table_infos[table_info.name].snapshot_id
+                    != table_info.snapshot_id
+                    or existing_table_infos[table_info.name].table_name() != table_info.table_name()
+                )
+            }
 
         self.environment_state.update_environment(environment)
 

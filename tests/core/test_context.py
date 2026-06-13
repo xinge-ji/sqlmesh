@@ -47,7 +47,7 @@ from sqlmesh.core.renderer import render_statements
 from sqlmesh.core.model.kind import ModelKindName
 from sqlmesh.core.state_sync.cache import CachingStateSync
 from sqlmesh.core.state_sync.db import EngineAdapterStateSync
-from sqlmesh.core.snapshot import Snapshot
+from sqlmesh.core.snapshot import Snapshot, SnapshotChangeCategory
 from sqlmesh.utils.connection_pool import SingletonConnectionPool, ThreadLocalSharedConnectionPool
 from sqlmesh.utils.date import (
     make_inclusive_end,
@@ -295,6 +295,7 @@ def _make_semantic_physical_drift_context_diff(
     *,
     modified_snapshots: t.Optional[t.Dict[str, t.Tuple[Snapshot, Snapshot]]] = None,
     new_snapshots: t.Optional[t.Dict[t.Any, Snapshot]] = None,
+    environment_snapshots_by_name: t.Optional[t.Dict[str, t.Any]] = None,
 ) -> ContextDiff:
     return ContextDiff(
         environment="test_environment",
@@ -313,6 +314,7 @@ def _make_semantic_physical_drift_context_diff(
         previous_plan_id=None,
         previously_promoted_snapshot_ids=set(),
         previous_finalized_snapshots=None,
+        environment_snapshots_by_name=environment_snapshots_by_name or {},
         environment_statements=[],
     )
 
@@ -379,6 +381,160 @@ def test_inject_semantic_physical_drift_skips_matching_key(
 
     assert not context_diff.modified_snapshots
     assert not context_diff.new_snapshots
+
+
+def test_inject_semantic_physical_drift_skips_parenthesized_single_key(
+    mocker: MockerFixture,
+) -> None:
+    model = SqlModel(
+        name="test_model",
+        query=parse_one("select 1 as id"),
+        kind=dict(name=ModelKindName.FULL),
+        dialect="doris",
+        physical_properties=d.parse_one("(unique_key = (id))"),
+    )
+    snapshot = Snapshot.from_node(model, nodes={model.fqn: model})
+    context_diff = _make_semantic_physical_drift_context_diff(snapshot)
+
+    adapter = mocker.Mock()
+    adapter.get_live_semantic_key_property.return_value = ("unique_key", exp.column("id"))
+    stub_context = SimpleNamespace(engine_adapters={"": adapter}, engine_adapter=adapter)
+
+    Context._inject_semantic_physical_drift(
+        stub_context,
+        context_diff,
+        {snapshot.name: snapshot},
+    )
+
+    assert not context_diff.modified_snapshots
+    assert not context_diff.new_snapshots
+
+
+def test_inject_semantic_physical_drift_uses_environment_snapshot_table(
+    mocker: MockerFixture,
+) -> None:
+    model = SqlModel(
+        name="test_model",
+        query=parse_one("select 1 as id"),
+        kind=dict(name=ModelKindName.INCREMENTAL_BY_UNIQUE_KEY, unique_key="id"),
+        dialect="doris",
+        physical_properties=d.parse_one("(unique_key = id)"),
+    )
+    snapshot = Snapshot.from_node(model, nodes={model.fqn: model})
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+    environment_snapshot_info = snapshot.table_info.copy(update={"version": "live_version"})
+    context_diff = _make_semantic_physical_drift_context_diff(
+        snapshot,
+        environment_snapshots_by_name={snapshot.name: environment_snapshot_info},
+    )
+
+    adapter = mocker.Mock()
+    adapter.get_live_semantic_key_property.return_value = ("unique_key", exp.column("id"))
+    stub_context = SimpleNamespace(engine_adapters={"": adapter}, engine_adapter=adapter)
+
+    Context._inject_semantic_physical_drift(
+        stub_context,
+        context_diff,
+        {snapshot.name: snapshot},
+    )
+
+    adapter.get_live_semantic_key_property.assert_called_once_with(
+        environment_snapshot_info.table_name()
+    )
+    assert not context_diff.modified_snapshots
+    assert not context_diff.new_snapshots
+
+
+def test_inject_semantic_physical_drift_skips_default_doris_duplicate_key(
+    mocker: MockerFixture,
+) -> None:
+    model = SqlModel(
+        name="test_model",
+        query=parse_one("select 1 as id"),
+        kind=dict(name=ModelKindName.FULL),
+        dialect="doris",
+    )
+    snapshot = Snapshot.from_node(model, nodes={model.fqn: model})
+    context_diff = _make_semantic_physical_drift_context_diff(snapshot)
+
+    adapter = mocker.Mock()
+    adapter.get_live_semantic_key_property.return_value = ("duplicate_key", exp.column("id"))
+    stub_context = SimpleNamespace(engine_adapters={"": adapter}, engine_adapter=adapter)
+
+    Context._inject_semantic_physical_drift(
+        stub_context,
+        context_diff,
+        {snapshot.name: snapshot},
+    )
+
+    assert not context_diff.modified_snapshots
+    assert not context_diff.new_snapshots
+
+
+def test_inject_semantic_physical_drift_keeps_explicit_unique_key_to_duplicate_key_drift(
+    mocker: MockerFixture,
+) -> None:
+    model = SqlModel(
+        name="test_model",
+        query=parse_one("select 1 as id"),
+        kind=dict(name=ModelKindName.FULL),
+        dialect="doris",
+        physical_properties=d.parse_one("(unique_key = id)"),
+    )
+    snapshot = Snapshot.from_node(model, nodes={model.fqn: model})
+    context_diff = _make_semantic_physical_drift_context_diff(snapshot)
+
+    adapter = mocker.Mock()
+    adapter.get_live_semantic_key_property.return_value = ("duplicate_key", exp.column("id"))
+    stub_context = SimpleNamespace(engine_adapters={"": adapter}, engine_adapter=adapter)
+
+    Context._inject_semantic_physical_drift(
+        stub_context,
+        context_diff,
+        {snapshot.name: snapshot},
+    )
+
+    assert snapshot.name in context_diff.modified_snapshots
+    new_snapshot, old_snapshot = context_diff.modified_snapshots[snapshot.name]
+    assert new_snapshot is snapshot
+    assert old_snapshot.model.physical_properties["duplicate_key"] == exp.column("id")
+    assert "unique_key" not in old_snapshot.model.physical_properties
+    assert context_diff.new_snapshots[snapshot.snapshot_id] is snapshot
+
+
+def test_inject_semantic_physical_drift_keeps_explicit_duplicate_key_column_drift(
+    mocker: MockerFixture,
+) -> None:
+    model = SqlModel(
+        name="test_model",
+        query=parse_one("select 1 as id, 2 as store_id"),
+        kind=dict(name=ModelKindName.FULL),
+        dialect="doris",
+        physical_properties=d.parse_one("(duplicate_key = id)"),
+    )
+    snapshot = Snapshot.from_node(model, nodes={model.fqn: model})
+    context_diff = _make_semantic_physical_drift_context_diff(snapshot)
+
+    adapter = mocker.Mock()
+    adapter.get_live_semantic_key_property.return_value = (
+        "duplicate_key",
+        exp.Tuple(expressions=[exp.column("id"), exp.column("store_id")]),
+    )
+    stub_context = SimpleNamespace(engine_adapters={"": adapter}, engine_adapter=adapter)
+
+    Context._inject_semantic_physical_drift(
+        stub_context,
+        context_diff,
+        {snapshot.name: snapshot},
+    )
+
+    assert snapshot.name in context_diff.modified_snapshots
+    new_snapshot, old_snapshot = context_diff.modified_snapshots[snapshot.name]
+    assert new_snapshot is snapshot
+    assert old_snapshot.model.physical_properties["duplicate_key"] == exp.Tuple(
+        expressions=[exp.column("id"), exp.column("store_id")]
+    )
+    assert context_diff.new_snapshots[snapshot.snapshot_id] is snapshot
 
 
 def test_inject_semantic_physical_drift_updates_existing_modified_snapshot(

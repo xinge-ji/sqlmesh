@@ -3874,6 +3874,9 @@ def test_environment_previous_finalized_snapshots(make_snapshot, mocker: MockerF
 
     snapshot_d = make_snapshot(SqlModel(name="d", query=parse_one("select 5 as five, ds")))
     snapshot_d.categorize_as(SnapshotChangeCategory.BREAKING)
+    environment_snapshot_d_table_info = snapshot_d.table_info.copy(
+        update={"version": "environment_version"}
+    )
 
     context_diff = ContextDiff(
         environment="test_environment",
@@ -3897,12 +3900,19 @@ def test_environment_previous_finalized_snapshots(make_snapshot, mocker: MockerF
         previous_plan_id=None,
         previously_promoted_snapshot_ids=set(),
         previous_finalized_snapshots=[snapshot_c.table_info, snapshot_d.table_info],
+        environment_snapshots_by_name={
+            snapshot_d.name: environment_snapshot_d_table_info,
+        },
         previous_gateway_managed_virtual_layer=False,
         gateway_managed_virtual_layer=False,
         environment_statements=[],
     )
 
     plan = PlanBuilder(context_diff).build()
+    snapshot_d_environment_info = next(
+        s for s in plan.environment.snapshots if s.name == snapshot_d.name
+    )
+    assert snapshot_d_environment_info.table_name() == environment_snapshot_d_table_info.table_name()
     assert set(plan.environment.previous_finalized_snapshots or []) == {
         snapshot_c.table_info,
         snapshot_d.table_info,
@@ -3914,8 +3924,16 @@ def test_environment_previous_finalized_snapshots(make_snapshot, mocker: MockerF
     assert set(plan.environment.previous_finalized_snapshots or []) == {
         snapshot_a.table_info,
         snapshot_c.table_info,
-        snapshot_d.table_info,
+        environment_snapshot_d_table_info,
     }
+    snapshot_d_previous_finalized_info = next(
+        s for s in (plan.environment.previous_finalized_snapshots or [])
+        if s.name == snapshot_d.name
+    )
+    assert (
+        snapshot_d_previous_finalized_info.table_name()
+        == environment_snapshot_d_table_info.table_name()
+    )
 
 
 def test_metadata_change(make_snapshot, mocker: MockerFixture):

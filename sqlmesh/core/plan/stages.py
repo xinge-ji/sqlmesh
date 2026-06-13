@@ -573,7 +573,20 @@ class PlanStagesBuilder:
 
         promoted_snapshots = set(plan.environment.promoted_snapshots)
         if existing_environment and plan.environment.can_partially_promote(existing_environment):
-            promoted_snapshots -= set(existing_environment.promoted_snapshots)
+            existing_table_infos = {
+                table_info.name: table_info
+                for table_info in existing_environment.promoted_snapshots
+            }
+            promoted_snapshots = {
+                table_info
+                for table_info in plan.environment.promoted_snapshots
+                if (
+                    table_info.name not in existing_table_infos
+                    or existing_table_infos[table_info.name].snapshot_id
+                    != table_info.snapshot_id
+                    or existing_table_infos[table_info.name].table_name() != table_info.table_name()
+                )
+            }
 
         demoted_environment_naming_info = (
             existing_environment.naming_info if demoted_snapshots and existing_environment else None

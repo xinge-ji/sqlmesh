@@ -16,6 +16,7 @@ import sys
 import typing as t
 from difflib import ndiff, unified_diff
 from functools import cached_property
+from pydantic import Field
 from sqlmesh.core import constants as c
 from sqlmesh.core.console import get_console
 from sqlmesh.core.macros import RuntimeStage
@@ -78,6 +79,8 @@ class ContextDiff(PydanticModel):
     """Snapshot IDs that were promoted by the previous plan."""
     previous_finalized_snapshots: t.Optional[t.List[SnapshotTableInfo]]
     """Snapshots from the previous finalized state."""
+    environment_snapshots_by_name: t.Dict[str, SnapshotTableInfo] = Field(default_factory=dict)
+    """Snapshots from the target environment by name before any drift injection."""
     previous_requirements: t.Dict[str, str] = {}
     """Previous requirements."""
     requirements: t.Dict[str, str] = {}
@@ -246,6 +249,7 @@ class ContextDiff(PydanticModel):
             previous_plan_id=previous_plan_id,
             previously_promoted_snapshot_ids=previously_promoted_snapshot_ids,
             previous_finalized_snapshots=env.previous_finalized_snapshots if env else None,
+            environment_snapshots_by_name=remote_snapshot_name_to_info,
             previous_requirements=env.requirements if env else {},
             requirements=requirements,
             diff_rendered=diff_rendered,
@@ -288,6 +292,7 @@ class ContextDiff(PydanticModel):
             previous_plan_id=env.plan_id,
             previously_promoted_snapshot_ids={s.snapshot_id for s in env.promoted_snapshots},
             previous_finalized_snapshots=env.previous_finalized_snapshots,
+            environment_snapshots_by_name={s.name: s for s in env.snapshots},
             previous_requirements=env.requirements,
             requirements=env.requirements,
             previous_environment_statements=environment_statements,
@@ -415,11 +420,22 @@ class ContextDiff(PydanticModel):
             *self.removed_snapshots.values(),
             *(old.table_info for _, old in self.modified_snapshots.values()),
             *[
-                s.table_info
+                self.environment_snapshot_table_info(s)
                 for s_id, s in self.snapshots.items()
                 if s_id not in self.added and s.name not in self.modified_snapshots
             ],
         ]
+
+    def environment_snapshot_table_info(self, snapshot: Snapshot) -> SnapshotTableInfo:
+        environment_snapshot = self.environment_snapshots_by_name.get(snapshot.name)
+        if (
+            environment_snapshot
+            and environment_snapshot.snapshot_id == snapshot.snapshot_id
+            and snapshot.snapshot_id not in self.added
+            and snapshot.name not in self.modified_snapshots
+        ):
+            return environment_snapshot
+        return snapshot.table_info
 
     def directly_modified(self, name: str) -> bool:
         """Returns whether or not a node was directly modified in this context.
