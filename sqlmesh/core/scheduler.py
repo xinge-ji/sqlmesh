@@ -554,9 +554,8 @@ class Scheduler:
                     else:
                         # If batch_index > 0, then the target table must exist since the first batch would have created it
                         target_table_exists = (
-                            snapshot.snapshot_id not in snapshots_to_create
-                            and snapshot.snapshot_id not in original_snapshots_to_create
-                        ) or node.batch_index > 0
+                            snapshot.snapshot_id not in snapshots_to_create or node.batch_index > 0
+                        )
                         audit_results = self.evaluate(
                             snapshot=snapshot,
                             environment_naming_info=environment_naming_info,

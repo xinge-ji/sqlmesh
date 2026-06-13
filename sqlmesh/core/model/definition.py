@@ -992,6 +992,25 @@ class _Model(ModelMeta, frozen=True):
                             self._path,
                         )
 
+        if self.dialect == "doris" and self.kind.is_materialized:
+            from sqlmesh.core.engine_adapter.doris import (
+                validate_doris_key_columns,
+                validate_doris_unsupported_key_properties,
+            )
+
+            rendered_physical_properties = self.render_physical_properties()
+            validate_doris_unsupported_key_properties(
+                model_name=self.name,
+                physical_properties=rendered_physical_properties,
+                path=self._path,
+            )
+            validate_doris_key_columns(
+                model_name=self.name,
+                physical_properties=rendered_physical_properties,
+                columns_to_types=self.columns_to_types,
+                path=self._path,
+            )
+
         if self.kind.is_incremental_by_time_range and not self.time_column:
             raise_config_error(
                 "Incremental by time range models must have a time_column field",

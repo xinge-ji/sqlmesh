@@ -1,21 +1,15 @@
 from __future__ import annotations
 
 import logging
-import typing as t
 import re
+import typing as t
 from datetime import date
 
 from sqlglot import exp, parse_one
 
 from sqlmesh.core.dialect import to_schema
-
 from sqlmesh.core.engine_adapter.base import (
     InsertOverwriteStrategy,
-)
-from sqlmesh.core.engine_adapter.mixins import (
-    LogicalMergeMixin,
-    NonTransactionalTruncateMixin,
-    PandasNativeFetchDFSupportMixin,
 )
 from sqlmesh.core.engine_adapter.doris_partition import (
     doris_partition_bounds,
@@ -23,6 +17,11 @@ from sqlmesh.core.engine_adapter.doris_partition import (
     doris_partition_ranges,
     missing_partition_ranges,
     parse_doris_partition_range,
+)
+from sqlmesh.core.engine_adapter.mixins import (
+    LogicalMergeMixin,
+    NonTransactionalTruncateMixin,
+    PandasNativeFetchDFSupportMixin,
 )
 from sqlmesh.core.engine_adapter.shared import (
     CommentCreationTable,
@@ -34,6 +33,7 @@ from sqlmesh.core.engine_adapter.shared import (
 from sqlmesh.utils import random_id
 from sqlmesh.utils.errors import (
     SQLMeshError,
+    raise_config_error,
 )
 
 if t.TYPE_CHECKING:
@@ -43,40 +43,104 @@ if t.TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DORIS_KEY_PROPERTY_PATTERN = re.compile(
-    r"\b(?P<kind>UNIQUE|DUPLICATE|AGGREGATE)\s+KEY\s*\((?P<columns>[^)]*)\)",
-    re.IGNORECASE | re.DOTALL,
-)
-_DORIS_KEY_PROPERTY_NAMES = {
-    "UNIQUE": "unique_key",
-    "DUPLICATE": "duplicate_key",
-    "AGGREGATE": "aggregate_key",
-}
+_DORIS_KEY_PHYSICAL_PROPERTY_NAMES = ("unique_key", "duplicate_key")
 
 
-def _doris_key_columns(key: t.Any) -> t.List[exp.Column]:
-    if isinstance(key, exp.Paren):
-        return _doris_key_columns(key.this)
-    if isinstance(key, exp.Tuple):
-        columns = []
-        for expression in key.expressions:
-            columns.extend(_doris_key_columns(expression))
-        return columns
-    if isinstance(key, exp.Column):
-        return [key]
-    if isinstance(key, exp.Literal):
-        return [exp.to_column(key.this)]
-    if isinstance(key, str):
-        return [exp.to_column(key)]
-    return [exp.to_column(str(key))]
+def _doris_key_columns(expression: t.Any) -> t.List[str]:
+    if isinstance(expression, exp.Paren):
+        return _doris_key_columns(expression.this)
+    if isinstance(expression, (exp.Tuple, exp.Array)):
+        return [column for expr in expression.expressions for column in _doris_key_columns(expr)]
+    if isinstance(expression, (list, tuple)):
+        return [column for expr in expression for column in _doris_key_columns(expr)]
+    if isinstance(expression, exp.Column):
+        return [expression.name]
+    if isinstance(expression, exp.Identifier):
+        return [expression.name]
+    if isinstance(expression, exp.Literal) and expression.is_string:
+        return [str(expression.this)]
+    if isinstance(expression, str):
+        return [expression]
+    raise SQLMeshError(
+        f"Unsupported Doris key expression '{expression}'. Doris unique_key and duplicate_key physical properties must contain column names only."
+    )
 
 
-def _doris_key_column_names(key: t.Any) -> t.Set[str]:
-    return {column.name for column in _doris_key_columns(key)}
+def doris_key_columns_from_physical_properties(
+    physical_properties: t.Mapping[str, t.Any],
+) -> t.Dict[str, t.List[str]]:
+    """Extract Doris key columns from model-defined physical properties."""
+    key_columns = {}
+    for key_property in _DORIS_KEY_PHYSICAL_PROPERTY_NAMES:
+        if key_property in physical_properties:
+            key_columns[key_property] = _doris_key_columns(physical_properties[key_property])
+    return key_columns
+
+
+def _normalize_doris_column_name(name: str) -> str:
+    normalized = str(name).strip()
+    while len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {'"', "`"}:
+        normalized = normalized[1:-1].strip()
+    return normalized.lower()
+
+
+def validate_doris_unsupported_key_properties(
+    *,
+    model_name: str,
+    physical_properties: t.Mapping[str, t.Any],
+    path: t.Optional[t.Any] = None,
+) -> None:
+    """Reject Doris key properties that SQLMesh does not render/validate yet."""
+    if "aggregate_key" in physical_properties:
+        raise_config_error(
+            f"Doris aggregate_key physical property is not supported for model '{model_name}'. SQLMesh currently supports unique_key and duplicate_key.",
+            path,
+        )
+
+
+def validate_doris_key_columns(
+    *,
+    model_name: str,
+    physical_properties: t.Mapping[str, t.Any],
+    columns_to_types: t.Optional[t.Mapping[str, exp.DataType]],
+    path: t.Optional[t.Any] = None,
+) -> None:
+    """Validate that Doris key columns exist in the model output columns."""
+    key_columns_by_property = doris_key_columns_from_physical_properties(physical_properties)
+    if not key_columns_by_property:
+        return
+
+    if columns_to_types is None:
+        raise_config_error(
+            f"Cannot validate Doris key columns for model '{model_name}' because rendered output columns are unavailable.",
+            path,
+        )
+
+    available_columns = sorted(columns_to_types)
+    normalized_available = {_normalize_doris_column_name(column) for column in available_columns}
+    missing_columns = []
+    seen_missing = set()
+    for key_columns in key_columns_by_property.values():
+        for key_column in key_columns:
+            normalized_key_column = _normalize_doris_column_name(key_column)
+            if (
+                normalized_key_column not in normalized_available
+                and normalized_key_column not in seen_missing
+            ):
+                missing_columns.append(key_column)
+                seen_missing.add(normalized_key_column)
+
+    if missing_columns:
+        raise_config_error(
+            f"Doris key columns {missing_columns} for model '{model_name}' are not present in rendered output columns {available_columns}.",
+            path,
+        )
 
 
 @set_catalog()
-class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, NonTransactionalTruncateMixin):
+class DorisEngineAdapter(
+    LogicalMergeMixin, PandasNativeFetchDFSupportMixin, NonTransactionalTruncateMixin
+):
     DIALECT = "doris"
     DEFAULT_BATCH_SIZE = 5000
     SUPPORTS_TRANSACTIONS = False
@@ -178,7 +242,9 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
                 )
                 result.append(data_object)
             except (ValueError, AttributeError) as e:
-                logger.error(f"Error processing row: {e}, row: {(schema_name, table_name, table_type)}")
+                logger.error(
+                    f"Error processing row: {e}, row: {(schema_name, table_name, table_type)}"
+                )
                 continue
 
         return result
@@ -230,69 +296,6 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
             **create_kwargs,
         )
 
-    def get_live_semantic_key_property(
-        self, table_name: TableName
-    ) -> t.Optional[t.Tuple[str, exp.Expression]]:
-        """Returns the live Doris key property from SHOW CREATE TABLE.
-
-        The return value is a `(property_name, property_value)` tuple where `property_name`
-        is `unique_key`, `duplicate_key`, or `aggregate_key`.
-        """
-        table = exp.to_table(table_name)
-        table_sql = table.sql(dialect=self.dialect, identify=True)
-
-        try:
-            create_sql = self.fetchone(f"SHOW CREATE TABLE {table_sql}")[1]
-        except Exception:
-            logger.debug("SHOW CREATE TABLE failed for %s", table_name, exc_info=True)
-            return None
-
-        if not create_sql:
-            return None
-
-        try:
-            create_exp = parse_one(create_sql, dialect=self.dialect)
-        except Exception:
-            logger.debug("Failed to parse SHOW CREATE TABLE for %s", table_name, exc_info=True)
-            return self._parse_key_property_from_create_sql(create_sql)
-
-        properties = create_exp.args.get("properties")
-        if not isinstance(properties, exp.Properties):
-            return self._parse_key_property_from_create_sql(create_sql)
-
-        for prop in properties.expressions:
-            if isinstance(prop, exp.UniqueKeyProperty):
-                return "unique_key", self._key_property_value(prop.expressions)
-            if isinstance(prop, exp.DuplicateKeyProperty):
-                return "duplicate_key", self._key_property_value(prop.expressions)
-
-        return self._parse_key_property_from_create_sql(create_sql)
-
-    def _parse_key_property_from_create_sql(
-        self, create_sql: str
-    ) -> t.Optional[t.Tuple[str, exp.Expression]]:
-        match = _DORIS_KEY_PROPERTY_PATTERN.search(create_sql)
-        if not match:
-            return None
-
-        key_name = _DORIS_KEY_PROPERTY_NAMES[match.group("kind").upper()]
-        columns_sql = match.group("columns")
-        try:
-            expressions = parse_one(f"SELECT {columns_sql}", dialect=self.dialect).expressions
-        except Exception:
-            logger.debug("Failed to parse Doris key columns from SHOW CREATE TABLE", exc_info=True)
-            return None
-        return key_name, self._key_property_value(expressions)
-
-    @staticmethod
-    def _key_property_value(expressions: t.Iterable[exp.Expression]) -> exp.Expression:
-        columns = [exp.to_column(getattr(expr, "name", str(expr))) for expr in expressions]
-        if not columns:
-            return exp.Tuple()
-        if len(columns) == 1:
-            return columns[0]
-        return exp.Tuple(expressions=columns)
-
     def _create_materialized_view(
         self,
         view_name: TableName,
@@ -310,7 +313,9 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
         import pandas as pd
 
         if isinstance(query_or_df, pd.DataFrame):
-            values: t.List[t.Tuple[t.Any, ...]] = list(query_or_df.itertuples(index=False, name=None))
+            values: t.List[t.Tuple[t.Any, ...]] = list(
+                query_or_df.itertuples(index=False, name=None)
+            )
             target_columns_to_types, source_columns = self._columns_to_types(
                 query_or_df, target_columns_to_types, source_columns
             )
@@ -358,7 +363,9 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
                 table_description=table_description,
                 partitioned_by=partitioned_by,
                 partition_interval_unit=(
-                    materialized_properties.get("partition_interval_unit") if materialized_properties else None
+                    materialized_properties.get("partition_interval_unit")
+                    if materialized_properties
+                    else None
                 ),
                 table_kind="MATERIALIZED_VIEW",
             )
@@ -385,7 +392,9 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
         """
         if materialized and kwargs.get("view_properties"):
             view_properties = kwargs.pop("view_properties")
-            if view_properties.get("materialized_type") == "SYNC" and view_properties.get("source_table"):
+            if view_properties.get("materialized_type") == "SYNC" and view_properties.get(
+                "source_table"
+            ):
                 # Format the source table name properly for Doris
                 source_table = view_properties.get("source_table")
                 if isinstance(source_table, exp.Table):
@@ -419,10 +428,14 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
             )
         )
 
-    def _create_table_comment(self, table_name: TableName, table_comment: str, table_kind: str = "TABLE") -> None:
+    def _create_table_comment(
+        self, table_name: TableName, table_comment: str, table_kind: str = "TABLE"
+    ) -> None:
         table_sql = exp.to_table(table_name).sql(dialect=self.dialect, identify=True)
 
-        self.execute(f'ALTER TABLE {table_sql} MODIFY COMMENT "{self._truncate_table_comment(table_comment)}"')
+        self.execute(
+            f'ALTER TABLE {table_sql} MODIFY COMMENT "{self._truncate_table_comment(table_comment)}"'
+        )
 
     def ensure_range_partitions(
         self,
@@ -468,7 +481,9 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
         table_sql = table.sql(dialect=self.dialect, identify=True)
         return f'ALTER TABLE {table_sql} MODIFY COLUMN {column_name} COMMENT "{self._truncate_column_comment(column_comment)}"'
 
-    def delete_from(self, table_name: TableName, where: t.Optional[t.Union[str, exp.Expression]] = None) -> None:
+    def delete_from(
+        self, table_name: TableName, where: t.Optional[t.Union[str, exp.Expression]] = None
+    ) -> None:
         """
         Delete from a table.
 
@@ -533,7 +548,11 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
 
     def _is_subquery_expression(self, expr: exp.Expression) -> bool:
         """Check if expression contains a subquery."""
-        return "query" in expr.args and expr.args["query"] and isinstance(expr.args["query"], exp.Subquery)
+        return (
+            "query" in expr.args
+            and expr.args["query"]
+            and isinstance(expr.args["query"], exp.Subquery)
+        )
 
     def _execute_delete_with_subquery(
         self, table_name: TableName, subquery_info: t.Tuple[exp.Expression, exp.Expression, bool]
@@ -633,7 +652,9 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
         # Convert primary_key to unique_key for Doris (Doris doesn't support primary keys)
         if primary_key and "unique_key" not in table_properties:
             # Represent as a Tuple of columns to match downstream handling
-            table_properties["unique_key"] = exp.Tuple(expressions=[exp.to_column(col) for col in primary_key])
+            table_properties["unique_key"] = exp.Tuple(
+                expressions=[exp.to_column(col) for col in primary_key]
+            )
 
         # Update kwargs with the modified table_properties
         kwargs["table_properties"] = table_properties
@@ -737,7 +758,9 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
         # Parse partition kind and columns from partitioned_by expressions
         partitioned_by, partition_kind = self._parse_partition_expressions(partitioned_by)
 
-        def _partition_type_to_str(value: t.Optional[t.Union[str, exp.Expression]]) -> t.Optional[str]:
+        def _partition_type_to_str(
+            value: t.Optional[t.Union[str, exp.Expression]],
+        ) -> t.Optional[str]:
             if value is None:
                 return None
             if isinstance(value, exp.Expression):
@@ -751,7 +774,9 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
         if partitions:
             if isinstance(partitions, exp.Tuple):
                 create_expressions = [
-                    exp.Var(this=e.this, quoted=False) if isinstance(e, exp.Literal) else to_raw_sql(e)
+                    exp.Var(this=e.this, quoted=False)
+                    if isinstance(e, exp.Literal)
+                    else to_raw_sql(e)
                     for e in partitions.expressions
                 ]
             elif isinstance(partitions, exp.Literal):
@@ -860,7 +885,11 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
             unit_var: t.Optional[exp.Var] = None
             starts_lit: t.Optional[exp.Literal] = None
             for e in tpl.expressions:
-                if isinstance(e, exp.EQ) and isinstance(e.this, exp.Column) and isinstance(e.this.this, exp.Identifier):
+                if (
+                    isinstance(e, exp.EQ)
+                    and isinstance(e.this, exp.Column)
+                    and isinstance(e.this.this, exp.Identifier)
+                ):
                     key = str(e.this.this.this).strip('"').lower()
                     val = e.expression
                     if key == "method":
@@ -929,7 +958,9 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
                 starts_lit: t.Optional[exp.Literal] = None
 
                 if isinstance(refresh_val, exp.Tuple):
-                    method_var, kind_str, every_lit, unit_var, starts_lit = _parse_refresh_tuple(refresh_val)
+                    method_var, kind_str, every_lit, unit_var, starts_lit = _parse_refresh_tuple(
+                        refresh_val
+                    )
                 else:
                     if refresh_trigger_val is not None:
                         trigger_text = (
@@ -950,20 +981,27 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
                     )
                 )
 
-        # Handle unique_key
+        # Handle unique_key / duplicate_key. Doris supports column-only key clauses.
         unique_key = table_properties_copy.pop("unique_key", None)
         if unique_key is not None:
-            properties.append(exp.UniqueKeyProperty(expressions=_doris_key_columns(unique_key)))
+            unique_key_columns = _doris_key_columns(unique_key)
+            properties.append(
+                exp.UniqueKeyProperty(expressions=[exp.to_column(k) for k in unique_key_columns])
+            )
 
-        # Handle duplicate_key
         # Both tables and materialized views support duplicate keys in Doris
         duplicate_key = table_properties_copy.pop("duplicate_key", None)
         if duplicate_key is not None:
-            properties.append(exp.DuplicateKeyProperty(expressions=_doris_key_columns(duplicate_key)))
+            duplicate_key_columns = _doris_key_columns(duplicate_key)
+            properties.append(
+                exp.DuplicateKeyProperty(expressions=[exp.to_column(k) for k in duplicate_key_columns])
+            )
 
         if table_description:
             properties.append(
-                exp.SchemaCommentProperty(this=exp.Literal.string(self._truncate_table_comment(table_description)))
+                exp.SchemaCommentProperty(
+                    this=exp.Literal.string(self._truncate_table_comment(table_description))
+                )
             )
 
         # Handle partitioning
@@ -971,18 +1009,16 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
         if partitioned_by:
             # Parse and normalize partition expressions
             partitioned_by, _ = self._parse_partition_expressions(partitioned_by)
-            # For tables, check if partitioned_by columns are in unique_key; for materialized views, allow regardless
+            # For tables, Doris requires partition columns to be part of the unique key.
             if unique_key is not None and not is_materialized_view:
-                key_cols_set = _doris_key_column_names(unique_key)
-
-                partition_cols = set()
-                for expr in partitioned_by:
-                    if hasattr(expr, "name"):
-                        partition_cols.add(str(expr.name))
-                    elif hasattr(expr, "this"):
-                        partition_cols.add(str(expr.this))
-                    else:
-                        partition_cols.add(str(expr))
+                key_cols_set = {
+                    _normalize_doris_column_name(column) for column in _doris_key_columns(unique_key)
+                }
+                partition_cols = {
+                    _normalize_doris_column_name(column)
+                    for expr in partitioned_by
+                    for column in _doris_key_columns(expr)
+                }
                 not_in_key = partition_cols - key_cols_set
                 if not_in_key:
                     logger.warning(
@@ -1031,12 +1067,16 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
                         elif isinstance(expr.expression, exp.Array):
                             # Handle expressions array
                             distributed_info[key] = [
-                                str(e.this) for e in expr.expression.expressions if hasattr(e, "this")
+                                str(e.this)
+                                for e in expr.expression.expressions
+                                if hasattr(e, "this")
                             ]
                         elif isinstance(expr.expression, exp.Tuple):
                             # Handle expressions tuple (array of strings)
                             distributed_info[key] = [
-                                str(e.this) for e in expr.expression.expressions if hasattr(e, "this")
+                                str(e.this)
+                                for e in expr.expression.expressions
+                                if hasattr(e, "this")
                             ]
                         else:
                             distributed_info[key] = str(expr.expression)
@@ -1089,13 +1129,19 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
                     )
                     properties.append(prop)
         else:
-            unique_key_property = next((prop for prop in properties if isinstance(prop, exp.UniqueKeyProperty)), None)
+            unique_key_property = next(
+                (prop for prop in properties if isinstance(prop, exp.UniqueKeyProperty)), None
+            )
             if unique_key_property:
                 # Use the first column from unique_key as the distribution key
                 if unique_key_property.expressions:
                     first_col = unique_key_property.expressions[0]
-                    column_name = str(first_col.this) if hasattr(first_col, "this") else str(first_col)
-                    logger.info(f"[Doris] Adding default distributed_by using unique_key column: {column_name}")
+                    column_name = (
+                        str(first_col.this) if hasattr(first_col, "this") else str(first_col)
+                    )
+                    logger.info(
+                        f"[Doris] Adding default distributed_by using unique_key column: {column_name}"
+                    )
                     properties.append(
                         exp.DistributedByProperty(
                             expressions=[exp.to_column(column_name)],
@@ -1105,6 +1151,10 @@ class DorisEngineAdapter(LogicalMergeMixin, PandasNativeFetchDFSupportMixin, Non
                     )
 
         # Only add generic properties if there are any left
+        if "aggregate_key" in table_properties_copy:
+            raise SQLMeshError(
+                "Doris aggregate_key physical property is not supported. SQLMesh currently supports unique_key and duplicate_key."
+            )
         if table_properties_copy:
             properties.extend(self._properties_to_expressions(table_properties_copy))
 

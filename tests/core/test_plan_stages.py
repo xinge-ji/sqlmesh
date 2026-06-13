@@ -7,7 +7,11 @@ from sqlmesh.core import dialect as d
 from sqlmesh.core.config import EnvironmentSuffixTarget
 from sqlmesh.core.config.common import VirtualEnvironmentMode
 from sqlmesh.core.model import SqlModel, ModelKindName
-from sqlmesh.core.plan.common import SnapshotIntervalClearRequest
+from sqlmesh.core.plan.common import (
+    PhysicalRecreationReason,
+    PhysicalRecreationRequest,
+    SnapshotIntervalClearRequest,
+)
 from sqlmesh.core.plan.definition import EvaluatablePlan
 from sqlmesh.core.plan.stages import (
     build_plan_stages,
@@ -78,6 +82,48 @@ def snapshot_c(make_snapshot, snapshot_a: Snapshot) -> Snapshot:
     snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
     return snapshot
 
+
+
+def test_evaluatable_plan_accepts_legacy_physical_recreation_set(snapshot_a: Snapshot):
+    environment = Environment(
+        snapshots=[snapshot_a.table_info],
+        start_at="2023-01-01",
+        end_at="2023-01-02",
+        plan_id="test_plan",
+        promoted_snapshot_ids=[snapshot_a.snapshot_id],
+    )
+
+    plan = EvaluatablePlan(
+        start="2023-01-01",
+        end="2023-01-02",
+        new_snapshots=[snapshot_a],
+        environment=environment,
+        no_gaps=False,
+        skip_backfill=False,
+        empty_backfill=False,
+        restatements={},
+        restate_all_snapshots=False,
+        is_dev=False,
+        allow_destructive_models=set(),
+        allow_additive_models=set(),
+        forward_only=False,
+        end_bounded=False,
+        ensure_finalized_snapshots=False,
+        ignore_cron=False,
+        directly_modified_snapshots=[snapshot_a.snapshot_id],
+        indirectly_modified_snapshots={},
+        metadata_updated_snapshots=[],
+        removed_snapshots=[],
+        snapshots_requiring_physical_recreation={snapshot_a.snapshot_id},
+        requires_backfill=True,
+        models_to_backfill=None,
+        execution_time="2023-01-02",
+        disabled_restatement_models=set(),
+    )
+
+    assert plan.snapshots_requiring_physical_recreation == {snapshot_a.snapshot_id}
+    request = plan.physical_recreation_requests[snapshot_a.snapshot_id]
+    assert request.reason == PhysicalRecreationReason.DORIS_SEMANTIC_KEY
 
 def test_build_plan_stages_basic(
     snapshot_a: Snapshot, snapshot_b: Snapshot, mocker: MockerFixture
@@ -2250,7 +2296,7 @@ def test_adjust_intervals_should_force_rebuild(make_snapshot, mocker: MockerFixt
     assert intervals == [(to_timestamp("2023-01-01"), to_timestamp("2023-01-02"))]
 
 
-def test_build_plan_stages_should_recreate_semantic_physical_drift(
+def test_build_plan_stages_recreates_physical_property_changed_snapshot(
     make_snapshot, mocker: MockerFixture
 ) -> None:
     new_snapshot = make_snapshot(
@@ -2322,7 +2368,14 @@ def test_build_plan_stages_should_recreate_semantic_physical_drift(
         indirectly_modified_snapshots={},
         metadata_updated_snapshots=[],
         removed_snapshots=[],
-        snapshots_requiring_physical_recreation={new_snapshot.snapshot_id},
+        physical_recreation_requests={
+            new_snapshot.snapshot_id: PhysicalRecreationRequest(
+                snapshot_id=new_snapshot.snapshot_id,
+                reason=PhysicalRecreationReason.DORIS_SEMANTIC_KEY,
+                propagates_downstream=True,
+                breaking=True,
+            )
+        },
         requires_backfill=True,
         models_to_backfill=None,
         execution_time="2023-01-02",

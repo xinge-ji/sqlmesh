@@ -11,7 +11,11 @@ from sqlmesh.core.context_diff import ContextDiff
 from sqlmesh.core.environment import Environment, EnvironmentNamingInfo, EnvironmentStatements
 from sqlmesh.utils.metaprogramming import Executable  # noqa
 from sqlmesh.core.node import IntervalUnit
-from sqlmesh.core.plan.common import requires_physical_recreation
+from sqlmesh.core.plan.common import (
+    PhysicalRecreationReason,
+    PhysicalRecreationRequest,
+    physical_recreation_request,
+)
 from sqlmesh.core.snapshot import (
     DeployabilityIndex,
     Intervals,
@@ -27,7 +31,7 @@ from sqlmesh.core.snapshot.definition import (
     format_intervals,
 )
 from sqlmesh.utils.date import TimeLike, now, to_datetime, to_timestamp
-from sqlmesh.utils.pydantic import PydanticModel
+from sqlmesh.utils.pydantic import PydanticModel, model_validator
 
 SnapshotMapping = t.Dict[SnapshotId, t.Set[SnapshotId]]
 UserProvidedFlags = t.Union[TimeLike, str, bool, t.List[str]]
@@ -175,6 +179,22 @@ class Plan(PydanticModel, frozen=True):
             if self.context_diff.metadata_updated(snapshot.name)
         }
 
+    @cached_property
+    def physical_recreation_requests(self) -> t.Dict[SnapshotId, PhysicalRecreationRequest]:
+        return {
+            request.snapshot_id: request
+            for new, old in self.context_diff.modified_snapshots.values()
+            if (request := physical_recreation_request(old, new)) is not None
+        }
+
+    @property
+    def snapshots_requiring_physical_recreation(self) -> t.Set[SnapshotId]:
+        return {
+            s_id
+            for s_id, request in self.physical_recreation_requests.items()
+            if request.recreate_direct_table
+        }
+
     @property
     def new_snapshots(self) -> t.List[Snapshot]:
         """Gets only new snapshots in the plan/environment."""
@@ -289,11 +309,7 @@ class Plan(PydanticModel, frozen=True):
             },
             metadata_updated_snapshots=sorted(self.metadata_updated),
             removed_snapshots=sorted(self.context_diff.removed_snapshots),
-            snapshots_requiring_physical_recreation={
-                new.snapshot_id
-                for new, old in self.context_diff.modified_snapshots.values()
-                if requires_physical_recreation(old, new)
-            },
+            physical_recreation_requests=self.physical_recreation_requests,
             requires_backfill=self.requires_backfill,
             models_to_backfill=self.models_to_backfill,
             start_override_per_model=self.start_override_per_model,
@@ -337,7 +353,10 @@ class EvaluatablePlan(PydanticModel):
     indirectly_modified_snapshots: t.Dict[str, t.List[SnapshotId]]
     metadata_updated_snapshots: t.List[SnapshotId]
     removed_snapshots: t.List[SnapshotId]
-    snapshots_requiring_physical_recreation: t.Set[SnapshotId] = Field(default_factory=set)
+    physical_recreation_requests: t.Dict[SnapshotId, PhysicalRecreationRequest] = Field(
+        default_factory=dict
+    )
+
     requires_backfill: bool
     models_to_backfill: t.Optional[t.Set[str]] = None
     start_override_per_model: t.Optional[t.Dict[str, datetime]] = None
@@ -347,6 +366,53 @@ class EvaluatablePlan(PydanticModel):
     environment_statements: t.Optional[t.List[EnvironmentStatements]] = None
     user_provided_flags: t.Optional[t.Dict[str, UserProvidedFlags]] = None
     selected_models: t.Optional[t.Set[str]] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _physical_recreation_requests_compat(cls, data: t.Any) -> t.Any:
+        if not isinstance(data, dict):
+            return data
+        if "snapshots_requiring_physical_recreation" not in data:
+            return data
+        data = data.copy()
+        snapshot_ids = data.pop("snapshots_requiring_physical_recreation") or set()
+        if "physical_recreation_requests" in data:
+            return data
+
+        data["physical_recreation_requests"] = {
+            snapshot_id: PhysicalRecreationRequest(
+                snapshot_id=snapshot_id,
+                reason=PhysicalRecreationReason.DORIS_SEMANTIC_KEY,
+                propagates_downstream=True,
+                breaking=True,
+            )
+            for snapshot_id in snapshot_ids
+        }
+        return data
+
+    @property
+    def snapshots_requiring_physical_recreation(self) -> t.Set[SnapshotId]:
+        return {
+            s_id
+            for s_id, request in self.physical_recreation_requests.items()
+            if request.recreate_direct_table
+        }
+
+    @property
+    def snapshots_skipping_schema_migration(self) -> t.Set[SnapshotId]:
+        return {
+            s_id
+            for s_id, request in self.physical_recreation_requests.items()
+            if request.skip_schema_migration
+        }
+
+    @property
+    def snapshots_requiring_physical_recreation_interval_clear(self) -> t.Set[SnapshotId]:
+        return {
+            s_id
+            for s_id, request in self.physical_recreation_requests.items()
+            if request.clear_direct_intervals
+        }
 
     def is_selected_for_backfill(self, model_fqn: str) -> bool:
         return self.models_to_backfill is None or model_fqn in self.models_to_backfill

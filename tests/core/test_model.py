@@ -4327,6 +4327,131 @@ def test_model_physical_properties() -> None:
             )
         )
 
+def _load_doris_model_with_key(key_property: str, query: str = "SELECT id, name FROM source"):
+    return load_sql_based_model(
+        d.parse(
+            f"""
+            MODEL (
+                name db.test_model,
+                kind FULL,
+                dialect doris,
+                physical_properties (
+                    {key_property}
+                )
+            );
+            {query};
+            """
+        )
+    )
+
+
+@pytest.mark.parametrize("key_property", ["unique_key", "duplicate_key"])
+def test_doris_key_physical_property_column_must_exist(key_property: str) -> None:
+    sql_model = _load_doris_model_with_key(f"{key_property} = goods_id")
+
+    with pytest.raises(ConfigError) as ex:
+        sql_model.validate_definition()
+
+    error = str(ex.value)
+    assert "Doris key columns ['goods_id'] for model 'db.test_model'" in error
+    assert "rendered output columns ['id', 'name']" in error
+
+
+def test_doris_aggregate_key_physical_property_is_rejected_until_supported() -> None:
+    sql_model = _load_doris_model_with_key("aggregate_key = goods_id")
+
+    with pytest.raises(ConfigError, match="Doris aggregate_key physical property is not supported"):
+        sql_model.validate_definition()
+
+
+def test_doris_key_physical_property_validation_is_case_and_quote_insensitive() -> None:
+    sql_model = _load_doris_model_with_key(
+        "unique_key = `goods_id`",
+        "SELECT 1 AS Goods_ID, 2 AS Name",
+    )
+
+    sql_model.validate_definition()
+
+
+@pytest.mark.parametrize("key_property", ["unique_key", "duplicate_key"])
+def test_doris_parenthesized_key_physical_property_validation_passes(key_property: str) -> None:
+    sql_model = _load_doris_model_with_key(
+        f"{key_property} = (id)",
+        "SELECT id, name FROM source",
+    )
+
+    sql_model.validate_definition()
+
+
+@pytest.mark.parametrize("key_property", ["unique_key", "duplicate_key"])
+def test_doris_parenthesized_key_physical_property_validation_fails(key_property: str) -> None:
+    sql_model = _load_doris_model_with_key(
+        f"{key_property} = (goods_id)",
+        "SELECT id, name FROM source",
+    )
+
+    with pytest.raises(ConfigError) as ex:
+        sql_model.validate_definition()
+
+    assert "Doris key columns ['goods_id']" in str(ex.value)
+
+
+def test_doris_unsupported_key_physical_property_expression_errors() -> None:
+    sql_model = _load_doris_model_with_key(
+        "unique_key = LOWER(id)",
+        "SELECT id FROM source",
+    )
+
+    with pytest.raises(SQLMeshError, match="Unsupported Doris key expression"):
+        sql_model.validate_definition()
+
+
+
+def test_doris_numeric_key_physical_property_literal_errors() -> None:
+    sql_model = _load_doris_model_with_key(
+        "unique_key = 1",
+        "SELECT id FROM source",
+    )
+
+    with pytest.raises(SQLMeshError, match="Unsupported Doris key expression"):
+        sql_model.validate_definition()
+def test_doris_tuple_key_physical_property_reports_only_missing_columns() -> None:
+    sql_model = _load_doris_model_with_key(
+        "unique_key = (id, goods_id, ds)",
+        "SELECT id, ds FROM source",
+    )
+
+    with pytest.raises(ConfigError) as ex:
+        sql_model.validate_definition()
+
+    error = str(ex.value)
+    assert "Doris key columns ['goods_id']" in error
+    assert "rendered output columns ['ds', 'id']" in error
+    assert "'name'" not in error
+
+
+def test_doris_key_physical_property_validation_requires_output_columns() -> None:
+    sql_model = _load_doris_model_with_key("unique_key = id", "SELECT * FROM source")
+    assert sql_model.columns_to_types is None
+
+    with pytest.raises(ConfigError) as ex:
+        sql_model.validate_definition()
+
+    assert (
+        "Cannot validate Doris key columns for model 'db.test_model' because rendered output columns are unavailable"
+        in str(ex.value)
+    )
+
+
+def test_doris_key_physical_property_validation_uses_rendered_properties() -> None:
+    sql_model = _load_doris_model_with_key(
+        "unique_key = @IF(TRUE, id, goods_id)",
+        "SELECT id FROM source",
+    )
+
+    sql_model.validate_definition()
+
+
 
 def test_model_physical_properties_labels() -> None:
     sql_model = load_sql_based_model(

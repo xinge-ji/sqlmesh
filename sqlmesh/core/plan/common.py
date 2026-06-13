@@ -2,6 +2,7 @@ from __future__ import annotations
 import typing as t
 import logging
 import re
+from enum import Enum
 from dataclasses import dataclass, field
 
 from sqlglot.optimizer.simplify import gen
@@ -10,6 +11,7 @@ from sqlmesh.core.state_sync import StateReader
 from sqlmesh.core.snapshot import Snapshot, SnapshotId, SnapshotIdAndVersion, SnapshotNameVersion
 from sqlmesh.core.snapshot.definition import Interval
 from sqlmesh.utils.dag import DAG
+from sqlmesh.utils.pydantic import PydanticModel
 from sqlmesh.utils.date import now_timestamp
 
 logger = logging.getLogger(__name__)
@@ -27,10 +29,8 @@ def should_force_rebuild(old: Snapshot, new: Snapshot) -> bool:
         # Seed models always need to be rebuilt to reflect changes in the seed file
         # Unless only their metadata has been updated (eg description added) and the seed file has not been touched
         return True
-    if _physical_property_change_category(new, old) in {
-        _PHYSICAL_PROPERTY_SEMANTIC,
-        _PHYSICAL_PROPERTY_UNKNOWN,
-    }:
+    recreation_request = physical_recreation_request(old, new)
+    if recreation_request and recreation_request.clear_direct_intervals:
         return True
     return is_breaking_kind_change(old, new)
 
@@ -62,28 +62,135 @@ _PHYSICAL_PROPERTY_NONE = "none"
 _PHYSICAL_PROPERTY_SEMANTIC = "semantic"
 _PHYSICAL_PROPERTY_LAYOUT = "layout"
 _PHYSICAL_PROPERTY_UNKNOWN = "unknown"
-_DORIS_PHYSICAL_RECREATION_PROPERTIES = {
+
+class PhysicalRecreationReason(str, Enum):
+    DORIS_SEMANTIC_KEY = "doris_semantic_key"
+    DORIS_SEMANTIC_PARTITION = "doris_semantic_partition"
+    DORIS_LAYOUT_DISTRIBUTION = "doris_layout_distribution"
+    DORIS_LAYOUT_STORAGE = "doris_layout_storage"
+    DORIS_UNKNOWN_PROPERTY = "doris_unknown_property"
+
+
+class PhysicalRecreationRequest(PydanticModel, frozen=True):
+    snapshot_id: SnapshotId
+    reason: PhysicalRecreationReason
+    skip_schema_migration: bool = True
+    recreate_direct_table: bool = True
+    clear_direct_intervals: bool = True
+    requires_full_backfill: bool = True
+    propagates_downstream: bool = False
+    breaking: bool = False
+
+
+_DORIS_KEY_PHYSICAL_PROPERTIES = {
     "unique_key",
     "duplicate_key",
-    "aggregate_key",
 }
+_DORIS_DISTRIBUTION_PHYSICAL_PROPERTIES = {
+    "distributed_by",
+    "distribution",
+    "distribution_key",
+    "bucket",
+    "buckets",
+    "bucket_count",
+}
+_DORIS_STORAGE_PHYSICAL_PROPERTIES = {
+    "replication_num",
+    "replication",
+    "replication_allocation",
+    "storage_policy",
+    "compression",
+    "codec",
+    "bloom_filter_columns",
+    "bloom_filter",
+    "index",
+    "indexes",
+}
+_DORIS_RETENTION_PHYSICAL_PROPERTIES = {
+    "ttl",
+    "retention",
+    "retention_period",
+    "retention_seconds",
+    "retention_days",
+}
+
+
+def physical_recreation_request(
+    old: Snapshot, new: Snapshot
+) -> t.Optional[PhysicalRecreationRequest]:
+    """Returns a reason-aware request for recreating a Doris physical table."""
+    if not new.is_model or not old.is_model:
+        return None
+    if new.model.dialect != "doris" or old.model.dialect != "doris":
+        return None
+    if not new.model.kind.is_materialized:
+        return None
+
+    changed_properties = _changed_physical_properties(new, old)
+    partitioning_changed = old.model.partitioned_by != new.model.partitioned_by
+    if not changed_properties and not partitioning_changed:
+        return None
+
+    reason = _doris_physical_recreation_reason(changed_properties, partitioning_changed)
+    propagates_downstream = reason in {
+        PhysicalRecreationReason.DORIS_SEMANTIC_KEY,
+        PhysicalRecreationReason.DORIS_SEMANTIC_PARTITION,
+        PhysicalRecreationReason.DORIS_UNKNOWN_PROPERTY,
+    }
+    return PhysicalRecreationRequest(
+        snapshot_id=new.snapshot_id,
+        reason=reason,
+        propagates_downstream=propagates_downstream,
+        breaking=propagates_downstream,
+    )
 
 
 def requires_physical_recreation(old: Snapshot, new: Snapshot) -> bool:
     """Returns whether a physical property change requires a new physical table."""
-    if not new.is_model or not old.is_model:
-        return False
-    if new.model.dialect != "doris" or old.model.dialect != "doris":
-        return False
-    if not new.model.kind.is_materialized:
-        return False
-    return bool(_changed_physical_properties(new, old) & _DORIS_PHYSICAL_RECREATION_PROPERTIES)
+    return physical_recreation_request(old, new) is not None
+
+
+def _doris_physical_recreation_reason(
+    changed_properties: t.Set[str], partitioning_changed: bool
+) -> PhysicalRecreationReason:
+    if any(not _is_known_doris_recreation_property(key) for key in changed_properties):
+        return PhysicalRecreationReason.DORIS_UNKNOWN_PROPERTY
+    if changed_properties & _DORIS_KEY_PHYSICAL_PROPERTIES:
+        return PhysicalRecreationReason.DORIS_SEMANTIC_KEY
+    if partitioning_changed or any(_is_doris_partition_property(key) for key in changed_properties):
+        return PhysicalRecreationReason.DORIS_SEMANTIC_PARTITION
+    if changed_properties & _DORIS_DISTRIBUTION_PHYSICAL_PROPERTIES:
+        return PhysicalRecreationReason.DORIS_LAYOUT_DISTRIBUTION
+    if changed_properties & _DORIS_STORAGE_PHYSICAL_PROPERTIES:
+        return PhysicalRecreationReason.DORIS_LAYOUT_STORAGE
+    return PhysicalRecreationReason.DORIS_UNKNOWN_PROPERTY
+
+
+def _is_known_doris_recreation_property(key: str) -> bool:
+    return (
+        key in _DORIS_KEY_PHYSICAL_PROPERTIES
+        or _is_doris_partition_property(key)
+        or key in _DORIS_DISTRIBUTION_PHYSICAL_PROPERTIES
+        or key in _DORIS_STORAGE_PHYSICAL_PROPERTIES
+    )
+
+
+def _is_doris_partition_property(key: str) -> bool:
+    return (
+        "partition" in key
+        or key in _DORIS_RETENTION_PHYSICAL_PROPERTIES
+        or key.startswith("retention_")
+    )
+
+
 
 
 
 
 def _physical_property_change_category(new: Snapshot, old: Snapshot) -> str:
     changed_properties = _changed_physical_properties(new, old)
+    if new.model.dialect == "doris" and old.model.partitioned_by != new.model.partitioned_by:
+        return _PHYSICAL_PROPERTY_SEMANTIC
     if not changed_properties:
         return _PHYSICAL_PROPERTY_NONE
 

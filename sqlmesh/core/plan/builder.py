@@ -24,7 +24,7 @@ from sqlmesh.core.plan.common import (
     _PHYSICAL_PROPERTY_UNKNOWN,
     _physical_property_change_category,
     is_breaking_kind_change,
-    requires_physical_recreation,
+    physical_recreation_request,
     should_force_rebuild,
 )
 from sqlmesh.core.plan.definition import (
@@ -297,6 +297,7 @@ class PlanBuilder:
             return self._latest_plan
 
         self._ensure_new_env_with_changes()
+        self._check_physical_recreation_backfill_preconditions()
         self._ensure_valid_date_range()
         self._ensure_no_broken_references()
 
@@ -327,6 +328,7 @@ class PlanBuilder:
             earliest_interval_start(self._context_diff.snapshots.values(), self.execution_time),
         )
         models_to_backfill = self._build_models_to_backfill(dag, restatements)
+        self._check_physical_recreation_backfill_safety(models_to_backfill)
 
         end_override_per_model = self._end_override_per_model
         if end_override_per_model and self.override_end:
@@ -753,6 +755,75 @@ class PlanBuilder:
                     if new.is_forward_only:
                         new.dev_intervals = new.intervals.copy()
 
+    def _physical_recreation_requests_requiring_full_backfill(
+        self,
+    ) -> t.Dict[SnapshotId, t.Any]:
+        return {
+            request.snapshot_id: request
+            for new, old in self._context_diff.modified_snapshots.values()
+            if (request := physical_recreation_request(old, new)) is not None
+            and request.requires_full_backfill
+        }
+
+    def _physical_recreation_reason_summary(self, requests: t.Dict[SnapshotId, t.Any]) -> str:
+        return ", ".join(
+            f"{self._context_diff.snapshots[s_id].name} ({request.reason.value})"
+            for s_id, request in sorted(requests.items())
+        )
+
+    def _check_physical_recreation_backfill_preconditions(
+        self, requests: t.Optional[t.Dict[SnapshotId, t.Any]] = None
+    ) -> None:
+        recreation_requests = (
+            self._physical_recreation_requests_requiring_full_backfill()
+            if requests is None
+            else requests
+        )
+        if not recreation_requests:
+            return
+
+        reasons = self._physical_recreation_reason_summary(recreation_requests)
+        if self.override_start or self.override_end or self._end_bounded:
+            raise PlanError(
+                "Cannot apply a bounded backfill for snapshots requiring physical recreation: "
+                f"{reasons}. Physical recreation requires a full direct backfill."
+            )
+
+        if self._start_override_per_model or self._end_override_per_model:
+            raise PlanError(
+                "Cannot apply a model-specific bounded backfill for snapshots requiring "
+                "physical recreation: "
+                f"{reasons}. Physical recreation requires a full direct backfill."
+            )
+
+        if self._skip_backfill or self._empty_backfill:
+            raise PlanError(
+                "Cannot skip backfill for snapshots requiring physical recreation: "
+                f"{reasons}. Physical recreation requires a full direct backfill."
+            )
+
+    def _check_physical_recreation_backfill_safety(
+        self, models_to_backfill: t.Optional[t.Set[str]]
+    ) -> None:
+        recreation_requests = self._physical_recreation_requests_requiring_full_backfill()
+        if not recreation_requests:
+            return
+
+        self._check_physical_recreation_backfill_preconditions(recreation_requests)
+
+        if models_to_backfill is not None:
+            excluded_requests = {
+                s_id: request
+                for s_id, request in recreation_requests.items()
+                if self._context_diff.snapshots[s_id].name not in models_to_backfill
+            }
+            if excluded_requests:
+                reasons = self._physical_recreation_reason_summary(excluded_requests)
+                raise PlanError(
+                    "Cannot exclude snapshots requiring physical recreation from backfill: "
+                    f"{reasons}. Physical recreation requires a full direct backfill."
+                )
+
     def _check_destructive_additive_changes(self, directly_modified: t.Set[SnapshotId]) -> None:
         for s_id in sorted(directly_modified):
             if s_id.name not in self._context_diff.modified_snapshots:
@@ -840,6 +911,17 @@ class PlanBuilder:
                     forward_only = False
 
             if s_id in self._choices:
+                if self._context_diff.directly_modified(s_id.name):
+                    new, old = self._context_diff.modified_snapshots[s_id.name]
+                    recreation_request = physical_recreation_request(old, new)
+                    if recreation_request:
+                        snapshot.categorize_as(
+                            SnapshotChangeCategory.BREAKING
+                            if recreation_request.breaking
+                            else SnapshotChangeCategory.NON_BREAKING,
+                            False,
+                        )
+                        continue
                 snapshot.categorize_as(self._choices[s_id], forward_only)
                 continue
 
@@ -860,6 +942,15 @@ class PlanBuilder:
         if self._context_diff.directly_modified(s_id.name):
             if self._auto_categorization_enabled:
                 new, old = self._context_diff.modified_snapshots[s_id.name]
+                recreation_request = physical_recreation_request(old, new)
+                if recreation_request:
+                    snapshot.categorize_as(
+                        SnapshotChangeCategory.BREAKING
+                        if recreation_request.breaking
+                        else SnapshotChangeCategory.NON_BREAKING,
+                        False,
+                    )
+                    return
                 if is_breaking_kind_change(old, new):
                     snapshot.categorize_as(SnapshotChangeCategory.BREAKING, False)
                     return
@@ -867,7 +958,7 @@ class PlanBuilder:
                     _PHYSICAL_PROPERTY_SEMANTIC,
                     _PHYSICAL_PROPERTY_UNKNOWN,
                 }:
-                    if requires_physical_recreation(old, new):
+                    if recreation_request:
                         snapshot.categorize_as(SnapshotChangeCategory.BREAKING, False)
                         return
                     snapshot.categorize_as(SnapshotChangeCategory.BREAKING, forward_only)
@@ -1143,12 +1234,17 @@ def _non_select_data_hash_values_match(new: Snapshot, old: Snapshot) -> bool:
     if type(new.model) is not type(old.model):
         return False
 
-    physical_property_change_category = _physical_property_change_category(new, old)
-    if physical_property_change_category in {
-        _PHYSICAL_PROPERTY_SEMANTIC,
-        _PHYSICAL_PROPERTY_UNKNOWN,
-    }:
-        return False
+    recreation_request = physical_recreation_request(old, new)
+    if recreation_request:
+        if recreation_request.propagates_downstream:
+            return False
+    else:
+        physical_property_change_category = _physical_property_change_category(new, old)
+        if physical_property_change_category in {
+            _PHYSICAL_PROPERTY_SEMANTIC,
+            _PHYSICAL_PROPERTY_UNKNOWN,
+        }:
+            return False
 
     old_model_without_columns = old.model.copy(
         update={"columns_to_types_": None, "columns": None, "physical_properties": None}

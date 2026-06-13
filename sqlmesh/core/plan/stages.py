@@ -286,14 +286,14 @@ class PlanStagesBuilder:
             snapshot_ids_with_schema_migration = [
                 s_id
                 for s_id in snapshot_ids_with_schema_migration
-                if s_id not in plan.snapshots_requiring_physical_recreation
+                if s_id not in plan.snapshots_skipping_schema_migration
             ]
             # Include all upstream dependencies of snapshots that require schema migration to make sure
             # the upstream tables are created before the schema updates are applied
             snapshots_with_schema_migration = [
                 snapshots[s_id]
                 for s_id in dag.subdag(*snapshot_ids_with_schema_migration)
-                if s_id not in plan.snapshots_requiring_physical_recreation
+                if s_id not in plan.snapshots_skipping_schema_migration
                 and snapshots[s_id].supports_schema_migration_in_prod
             ]
 
@@ -688,7 +688,7 @@ class PlanStagesBuilder:
         # Make sure the intervals are up to date and restatements are reflected
         self.state_reader.refresh_snapshot_intervals(snapshots_by_name.values())
         for snapshot in snapshots_by_name.values():
-            if snapshot.snapshot_id in plan.snapshots_requiring_physical_recreation:
+            if snapshot.snapshot_id in plan.snapshots_requiring_physical_recreation_interval_clear:
                 snapshot.intervals = []
 
         if not existing_environment:

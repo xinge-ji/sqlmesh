@@ -6,11 +6,34 @@ from sqlglot import parse_one
 
 from tests.core.engine_adapter import to_sql_calls
 
-from sqlmesh.core.engine_adapter.doris import DorisEngineAdapter
+from sqlmesh.core.engine_adapter.doris import (
+    DorisEngineAdapter,
+    doris_key_columns_from_physical_properties,
+)
+from sqlmesh.utils.errors import SQLMeshError
 
 from pytest_mock.plugin import MockerFixture
 
 pytestmark = [pytest.mark.doris, pytest.mark.engine]
+
+
+def test_doris_key_columns_from_physical_properties_extracts_expression_forms():
+    assert doris_key_columns_from_physical_properties(
+        {
+            "unique_key": exp.Tuple(
+                expressions=[
+                    exp.to_column("id"),
+                    exp.Literal.string("ds"),
+                    exp.Paren(this=exp.to_column("Goods_ID")),
+                ]
+            ),
+            "duplicate_key": exp.to_column("duplicate_id"),
+            "distributed_by": exp.Literal.string("id"),
+        }
+    ) == {
+        "unique_key": ["id", "ds", "Goods_ID"],
+        "duplicate_key": ["duplicate_id"],
+    }
 
 
 def test_create_view(make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter]):
@@ -131,6 +154,84 @@ def test_create_table(make_mocked_engine_adapter: t.Callable[..., DorisEngineAda
     adapter.cursor.reset_mock()
 
 
+def test_create_table_with_parenthesized_doris_keys(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    adapter.create_table(
+        "test_unique_key",
+        target_columns_to_types={"ds": exp.DataType.build("DATE")},
+        table_properties={"unique_key": exp.Paren(this=exp.to_column("ds"))},
+    )
+    adapter.create_table(
+        "test_duplicate_key",
+        target_columns_to_types={"ds": exp.DataType.build("DATE")},
+        table_properties={"duplicate_key": exp.Paren(this=exp.to_column("ds"))},
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `test_unique_key` (`ds` DATE) UNIQUE KEY (`ds`) DISTRIBUTED BY HASH (`ds`) BUCKETS 10",
+        "CREATE TABLE IF NOT EXISTS `test_duplicate_key` (`ds` DATE) DUPLICATE KEY (`ds`)",
+    ]
+
+
+def test_create_table_with_parenthesized_unique_key_keeps_partition(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    adapter.create_table(
+        "test_table",
+        target_columns_to_types={"ds": exp.DataType.build("DATE")},
+        partitioned_by=[exp.Literal.string("RANGE(ds)")],
+        table_properties={
+            "unique_key": exp.Paren(this=exp.to_column("ds")),
+            "partitions": exp.Literal.string(
+                "FROM ('2024-01-01') TO ('2024-02-01') INTERVAL 1 DAY"
+            ),
+        },
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `test_table` (`ds` DATE) UNIQUE KEY (`ds`) PARTITION BY RANGE (`ds`) (FROM ('2024-01-01') TO ('2024-02-01') INTERVAL 1 DAY) DISTRIBUTED BY HASH (`ds`) BUCKETS 10",
+    ]
+
+
+def test_create_table_with_unsupported_doris_key_expression_errors(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    with pytest.raises(SQLMeshError, match="Unsupported Doris key expression"):
+        adapter.create_table(
+            "test_table",
+            target_columns_to_types={"ds": exp.DataType.build("DATE")},
+            table_properties={"unique_key": exp.Add(this=exp.to_column("ds"), expression=exp.Literal.number(1))},
+        )
+
+
+    with pytest.raises(SQLMeshError, match="Unsupported Doris key expression"):
+        adapter.create_table(
+            "test_table",
+            target_columns_to_types={"ds": exp.DataType.build("DATE")},
+            table_properties={"unique_key": exp.Literal.number(1)},
+        )
+
+
+
+def test_create_table_with_unsupported_doris_aggregate_key_errors(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    with pytest.raises(SQLMeshError, match="Doris aggregate_key physical property is not supported"):
+        adapter.create_table(
+            "test_table",
+            target_columns_to_types={"id": exp.DataType.build("INT")},
+            table_properties={"aggregate_key": exp.to_column("id")},
+        )
+
 def test_create_table_like(make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter]):
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
 
@@ -139,47 +240,6 @@ def test_create_table_like(make_mocked_engine_adapter: t.Callable[..., DorisEngi
     assert to_sql_calls(adapter) == [
         "CREATE TABLE IF NOT EXISTS `target_table` LIKE `source_table`",
     ]
-
-
-@pytest.mark.parametrize(
-    ("show_create_sql", "expected_key", "expected_value_sql"),
-    [
-        (
-            "CREATE TABLE `test_table` (`id` INT) UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10",
-            "unique_key",
-            "id",
-        ),
-        (
-            "CREATE TABLE `test_table` (`id` INT) DUPLICATE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10",
-            "duplicate_key",
-            "id",
-        ),
-        (
-            "CREATE TABLE `test_table` (`id` INT, `ds` DATE) UNIQUE KEY (`id`, `ds`) DISTRIBUTED BY HASH (`id`) BUCKETS 10",
-            "unique_key",
-            "(id, ds)",
-        ),
-        (
-            "CREATE TABLE `test_table` (`id` INT, `ds` DATE) AGGREGATE KEY (`id`, `ds`) DISTRIBUTED BY HASH (`id`) BUCKETS 10",
-            "aggregate_key",
-            "(id, ds)",
-        ),
-    ],
-)
-def test_get_live_semantic_key_property(
-    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
-    mocker: MockerFixture,
-    show_create_sql: str,
-    expected_key: str,
-    expected_value_sql: str,
-):
-    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
-    mocker.patch.object(adapter, "fetchone", return_value=(None, show_create_sql))
-
-    assert adapter.get_live_semantic_key_property("test_table") == (
-        expected_key,
-        parse_one(expected_value_sql, dialect="doris") if expected_value_sql != "id" else exp.column("id"),
-    )
 
 
 def test_create_schema(make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter]):

@@ -30,6 +30,7 @@ from sqlmesh.core.model import (
 from sqlmesh.core.model.kind import OnDestructiveChange, OnAdditiveChange, ViewKind
 from sqlmesh.core.model.seed import Seed
 from sqlmesh.core.plan import Plan, PlanBuilder, SnapshotIntervals
+from sqlmesh.core.plan.common import PhysicalRecreationReason
 from sqlmesh.core.snapshot import (
     DeployabilityIndex,
     Snapshot,
@@ -2955,7 +2956,12 @@ def test_semantic_physical_property_change_forces_same_version_rebuild(make_snap
     assert snapshot_a.intervals == []
     assert snapshot_a.change_category == SnapshotChangeCategory.BREAKING
     assert plan.directly_modified == {snapshot_a.snapshot_id}
-    assert plan.to_evaluatable().snapshots_requiring_physical_recreation == {
+    physical_recreation_requests = plan.physical_recreation_requests
+    request = physical_recreation_requests[snapshot_a.snapshot_id]
+    assert request.reason == PhysicalRecreationReason.DORIS_SEMANTIC_KEY
+    assert request.propagates_downstream
+    assert request.breaking
+    assert plan.snapshots_requiring_physical_recreation == {
         snapshot_a.snapshot_id
     }
 
@@ -2965,6 +2971,8 @@ def test_layout_physical_property_change_does_not_propagate_downstream(make_snap
         SqlModel(
             name="a",
             query=parse_one("select 1 as id, 2 as stable_col, ds"),
+            kind=FullKind(),
+            dialect="doris",
             physical_properties=d.parse_one("(distributed_by = 'hash_id_16')"),
         )
     )
@@ -2972,6 +2980,8 @@ def test_layout_physical_property_change_does_not_propagate_downstream(make_snap
         SqlModel(
             name="a",
             query=parse_one("select 1 as id, 2 as stable_col, ds"),
+            kind=FullKind(),
+            dialect="doris",
             physical_properties=d.parse_one("(distributed_by = 'hash_id_32')"),
         )
     )
@@ -3027,13 +3037,60 @@ def test_layout_physical_property_change_does_not_propagate_downstream(make_snap
     assert updated_snapshot_a.change_category == SnapshotChangeCategory.NON_BREAKING
     assert updated_snapshot_b.change_category == SnapshotChangeCategory.METADATA
     assert updated_snapshot_c.change_category == SnapshotChangeCategory.METADATA
+    physical_recreation_requests = plan.physical_recreation_requests
+    request = physical_recreation_requests[updated_snapshot_a.snapshot_id]
+    assert request.reason == PhysicalRecreationReason.DORIS_LAYOUT_DISTRIBUTION
+    assert not request.propagates_downstream
+    assert not request.breaking
 
+
+
+def test_layout_storage_physical_property_change_does_not_propagate_downstream(make_snapshot):
+    snapshot_a = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, ds"),
+            kind=FullKind(),
+            dialect="doris",
+            physical_properties=d.parse_one("(replication_allocation = 'old')"),
+        )
+    )
+    updated_snapshot_a = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, ds"),
+            kind=FullKind(),
+            dialect="doris",
+            physical_properties=d.parse_one("(replication_allocation = 'new')"),
+        )
+    )
+    snapshot_b = make_snapshot(
+        SqlModel(name="b", query=parse_one("select id, ds from a")),
+        nodes={'"a"': snapshot_a.model},
+    )
+    updated_snapshot_b = make_snapshot(snapshot_b.model, nodes={'"a"': updated_snapshot_a.model})
+
+    plan = PlanBuilder(
+        _column_level_context_diff(
+            (updated_snapshot_a, snapshot_a),
+            (updated_snapshot_b, snapshot_b),
+        )
+    ).build()
+
+    assert plan.indirectly_modified == {}
+    assert updated_snapshot_a.change_category == SnapshotChangeCategory.NON_BREAKING
+    assert updated_snapshot_b.change_category == SnapshotChangeCategory.METADATA
+    request = plan.physical_recreation_requests[updated_snapshot_a.snapshot_id]
+    assert request.reason == PhysicalRecreationReason.DORIS_LAYOUT_STORAGE
+    assert not request.propagates_downstream
 
 def test_unknown_physical_property_change_propagates_to_all_downstream(make_snapshot):
     snapshot_a = make_snapshot(
         SqlModel(
             name="a",
             query=parse_one("select 1 as id, 2 as stable_col, ds"),
+            kind=FullKind(),
+            dialect="doris",
             physical_properties=d.parse_one("(custom_engine_option = 'old')"),
         )
     )
@@ -3041,6 +3098,8 @@ def test_unknown_physical_property_change_propagates_to_all_downstream(make_snap
         SqlModel(
             name="a",
             query=parse_one("select 1 as id, 2 as stable_col, ds"),
+            kind=FullKind(),
+            dialect="doris",
             physical_properties=d.parse_one("(custom_engine_option = 'new')"),
         )
     )
@@ -3087,6 +3146,131 @@ def test_unknown_physical_property_change_propagates_to_all_downstream(make_snap
     }
     assert updated_snapshot_a.change_category == SnapshotChangeCategory.BREAKING
     assert updated_snapshot_b.change_category == SnapshotChangeCategory.INDIRECT_BREAKING
+    physical_recreation_requests = plan.physical_recreation_requests
+    request = physical_recreation_requests[updated_snapshot_a.snapshot_id]
+    assert request.reason == PhysicalRecreationReason.DORIS_UNKNOWN_PROPERTY
+    assert request.propagates_downstream
+    assert request.breaking
+
+
+
+def test_unsupported_doris_aggregate_key_change_is_unknown_physical_property(make_snapshot):
+    old_snapshot = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, ds"),
+            kind=FullKind(),
+            dialect="doris",
+            physical_properties=d.parse_one("(aggregate_key = id)"),
+        )
+    )
+    new_snapshot = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, ds"),
+            kind=FullKind(),
+            dialect="doris",
+            physical_properties=d.parse_one("(aggregate_key = (id, ds))"),
+        )
+    )
+
+    plan = PlanBuilder(_doris_recreation_context_diff(new_snapshot, old_snapshot)).build()
+
+    request = plan.physical_recreation_requests[new_snapshot.snapshot_id]
+    assert request.reason == PhysicalRecreationReason.DORIS_UNKNOWN_PROPERTY
+    assert request.propagates_downstream
+    assert request.breaking
+
+def _doris_recreation_context_diff(new_snapshot: Snapshot, old_snapshot: Snapshot) -> ContextDiff:
+    return ContextDiff(
+        environment="test_environment",
+        is_new_environment=True,
+        is_unfinalized_environment=False,
+        normalize_environment_name=True,
+        create_from="prod",
+        create_from_env_exists=True,
+        added=set(),
+        removed_snapshots={},
+        modified_snapshots={new_snapshot.name: (new_snapshot, old_snapshot)},
+        snapshots={new_snapshot.snapshot_id: new_snapshot},
+        new_snapshots={new_snapshot.snapshot_id: new_snapshot},
+        previous_plan_id=None,
+        previously_promoted_snapshot_ids=set(),
+        previous_finalized_snapshots=None,
+        previous_gateway_managed_virtual_layer=False,
+        gateway_managed_virtual_layer=False,
+        environment_statements=[],
+    )
+
+
+def _doris_recreation_snapshots(make_snapshot) -> t.Tuple[Snapshot, Snapshot]:
+    old_snapshot = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, ds"),
+            kind=FullKind(),
+            dialect="doris",
+            physical_properties=d.parse_one("(unique_key = id)"),
+        )
+    )
+    new_snapshot = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, ds"),
+            kind=FullKind(),
+            dialect="doris",
+            physical_properties=d.parse_one("(unique_key = (id, ds))"),
+        )
+    )
+    return new_snapshot, old_snapshot
+
+
+def test_physical_recreation_rejects_skip_backfill(make_snapshot):
+    new_snapshot, old_snapshot = _doris_recreation_snapshots(make_snapshot)
+
+    with pytest.raises(PlanError, match="Cannot skip backfill.*doris_semantic_key"):
+        PlanBuilder(
+            _doris_recreation_context_diff(new_snapshot, old_snapshot),
+            skip_backfill=True,
+        ).build()
+
+
+def test_physical_recreation_rejects_bounded_backfill(make_snapshot):
+    new_snapshot, old_snapshot = _doris_recreation_snapshots(make_snapshot)
+
+    with pytest.raises(PlanError, match="Cannot apply a bounded backfill.*doris_semantic_key"):
+        PlanBuilder(
+            _doris_recreation_context_diff(new_snapshot, old_snapshot),
+            start="2023-01-01",
+        ).build()
+
+
+def test_physical_recreation_rejects_backfill_selection_excluding_recreated_snapshot(
+    make_snapshot,
+):
+    new_snapshot, old_snapshot = _doris_recreation_snapshots(make_snapshot)
+
+    with pytest.raises(PlanError, match="Cannot exclude snapshots.*doris_semantic_key"):
+        PlanBuilder(
+            _doris_recreation_context_diff(new_snapshot, old_snapshot),
+            backfill_models=["missing_model"],
+        ).build()
+
+
+
+def test_physical_recreation_rejects_model_specific_bounded_backfill(make_snapshot):
+    new_snapshot, old_snapshot = _doris_recreation_snapshots(make_snapshot)
+
+    with pytest.raises(
+        PlanError,
+        match="Cannot apply a model-specific bounded backfill.*doris_semantic_key",
+    ):
+        PlanBuilder(
+            _doris_recreation_context_diff(new_snapshot, old_snapshot),
+            start_override_per_model={
+                new_snapshot.name: to_datetime("2023-01-01")
+            },
+        ).build()
 
 
 def test_non_column_level_change_propagates_to_all_downstream(make_snapshot):
