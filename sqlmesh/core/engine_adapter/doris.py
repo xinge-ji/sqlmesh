@@ -233,6 +233,20 @@ class DorisEngineAdapter(
             **drop_args,
         )
 
+    def adjust_physical_properties_for_incremental(
+        self,
+        physical_properties: t.Dict[str, t.Any],
+        *,
+        requires_delete_capable_table: bool,
+        unique_key: t.Optional[t.List[exp.Expr]],
+        model_name: str,
+    ) -> t.Dict[str, t.Any]:
+        if unique_key and _get_doris_physical_property(physical_properties, "unique_key") is None:
+            physical_properties["unique_key"] = (
+                unique_key[0] if len(unique_key) == 1 else exp.Tuple(expressions=unique_key)
+            )
+        return physical_properties
+
     def _get_data_objects(
         self, schema_name: SchemaName, object_names: t.Optional[t.Set[str]] = None
     ) -> t.List[DataObject]:

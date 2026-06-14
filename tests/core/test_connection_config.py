@@ -21,6 +21,7 @@ from sqlmesh.core.config.connection import (
     MySQLConnectionConfig,
     PostgresConnectionConfig,
     SnowflakeConnectionConfig,
+    StarRocksConnectionConfig,
     TrinoAuthenticationMethod,
     AthenaConnectionConfig,
     MSSQLConnectionConfig,
@@ -811,6 +812,7 @@ def test_duckdb_attach_ducklake_catalog(make_config):
                 type="ducklake",
                 path="catalog.ducklake",
                 data_path="/tmp/ducklake_data",
+                override_data_path=False,
                 encrypted=True,
                 data_inlining_row_limit=10,
             ),
@@ -1132,6 +1134,27 @@ def test_bigquery(make_config):
     assert config.get_catalog() == "project"
     assert config.is_recommended_for_state_sync is False
 
+    # Test reservation
+    config_with_reservation = make_config(
+        type="bigquery",
+        project="project",
+        reservation="projects/my-project/locations/us-central1/reservations/my-reservation",
+        check_import=False,
+    )
+    assert isinstance(config_with_reservation, BigQueryConnectionConfig)
+    assert (
+        config_with_reservation.reservation
+        == "projects/my-project/locations/us-central1/reservations/my-reservation"
+    )
+
+    # Test that reservation is included in _extra_engine_config
+    extra_config = config_with_reservation._extra_engine_config
+    assert "reservation" in extra_config
+    assert (
+        extra_config["reservation"]
+        == "projects/my-project/locations/us-central1/reservations/my-reservation"
+    )
+
     with pytest.raises(ConfigError, match="you must also specify the `project` field"):
         make_config(type="bigquery", execution_project="execution_project", check_import=False)
 
@@ -1400,6 +1423,35 @@ def test_databricks(make_config):
             server_hostname="dbc-test.cloud.databricks.com",
             auth_type="databricks-oauth",
         )
+
+
+def test_databricks_shared_connection(make_config):
+    """Databricks should use a shared connection pool to prevent OAuth CSRF races.
+
+    When concurrent_tasks > 1, ThreadLocalConnectionPool creates one connection per
+    thread. For U2M OAuth, each thread triggers its own browser-based OAuth flow;
+    these race on the CSRF state parameter and cause MismatchingStateError.
+
+    Setting shared_connection = True causes ThreadLocalSharedConnectionPool to be
+    used instead: a single connection is created (behind a lock) and each thread
+    gets its own cursor, so only one OAuth flow is ever initiated.
+
+    See: https://github.com/tobymao/sqlmesh/issues/5646
+    """
+    from sqlmesh.utils.connection_pool import ThreadLocalSharedConnectionPool
+
+    config = make_config(
+        type="databricks",
+        server_hostname="dbc-test.cloud.databricks.com",
+        http_path="sql/test/foo",
+        access_token="test-token",
+        concurrent_tasks=4,
+    )
+    assert isinstance(config, DatabricksConnectionConfig)
+    assert config.shared_connection is True
+
+    adapter = config.create_engine_adapter()
+    assert isinstance(adapter._connection_pool, ThreadLocalSharedConnectionPool)
 
 
 def test_engine_import_validator():
@@ -1971,8 +2023,9 @@ def test_doris(make_config):
     assert config.database == "demo"
     assert config.DIALECT == "doris"
     assert config.DISPLAY_NAME == "Apache Doris"
-    assert config.DISPLAY_ORDER == 18
+    assert config.DISPLAY_ORDER == 19
     assert config.is_recommended_for_state_sync is False
+    assert config.is_forbidden_for_state_sync is True
 
     # Test with minimal configuration (using default port)
     minimal_config = make_config(
@@ -2001,6 +2054,63 @@ def test_doris(make_config):
         check_import=False,
     )
     assert isinstance(advanced_config, DorisConnectionConfig)
+    assert advanced_config.charset == "utf8mb4"
+    assert advanced_config.ssl_disabled is True
+    assert advanced_config.concurrent_tasks == 10
+
+
+def test_starrocks(make_config):
+    """Test StarRocksConnectionConfig basic functionality"""
+    # Basic configuration
+    config = make_config(
+        type="starrocks",
+        host="localhost",
+        user="root",
+        password="password",
+        port=9030,
+        database="testdb",
+        check_import=False,
+    )
+    assert isinstance(config, StarRocksConnectionConfig)
+    assert config.type_ == "starrocks"
+    assert config.host == "localhost"
+    assert config.user == "root"
+    assert config.password == "password"
+    assert config.port == 9030
+    assert config.database == "testdb"
+    assert config.DIALECT == "starrocks"
+    assert config.DISPLAY_NAME == "StarRocks"
+    assert config.DISPLAY_ORDER == 18
+    assert config.is_recommended_for_state_sync is False
+    assert config.is_forbidden_for_state_sync is True
+
+    # Test with minimal configuration (using default port)
+    minimal_config = make_config(
+        type="starrocks",
+        host="starrocks-fe",
+        user="starrocks_user",
+        password="starrocks_pswd",
+        check_import=False,
+    )
+    assert isinstance(minimal_config, StarRocksConnectionConfig)
+    assert minimal_config.port == 9030  # Default StarRocks FE port
+    assert minimal_config.host == "starrocks-fe"
+    assert minimal_config.user == "starrocks_user"
+
+    # Test with additional MySQL-compatible options
+    advanced_config = make_config(
+        type="starrocks",
+        host="starrocks-fe",
+        user="admin",
+        password="admin123",
+        port=9030,
+        database="testdb",
+        charset="utf8mb4",
+        ssl_disabled=True,
+        concurrent_tasks=10,
+        check_import=False,
+    )
+    assert isinstance(advanced_config, StarRocksConnectionConfig)
     assert advanced_config.charset == "utf8mb4"
     assert advanced_config.ssl_disabled is True
     assert advanced_config.concurrent_tasks == 10
