@@ -10747,6 +10747,36 @@ def test_data_hash_unchanged_when_column_type_uses_default_dialect():
     assert model.data_hash == deserialized_model.data_hash
 
 
+def test_lookback_is_metadata_only_change():
+    model = create_sql_model(
+        "foo",
+        parse_one("SELECT 1 AS a"),
+        kind=IncrementalByTimeRangeKind(time_column=TimeColumn(column="ds"), lookback=1),
+    )
+    updated_model = model.copy(
+        update={"kind": model.kind.copy(update={"lookback": 2})},
+    )
+
+    assert model.data_hash == updated_model.data_hash
+    assert model.metadata_hash != updated_model.metadata_hash
+    assert updated_model.is_metadata_only_change(model)
+
+
+def test_custom_kind_lookback_is_metadata_only_change():
+    model = create_sql_model(
+        "foo",
+        parse_one("SELECT 1 AS a"),
+        kind=CustomKind(materialization="test_materialization", dialect="duckdb", lookback=1),
+    )
+    updated_model = model.copy(
+        update={"kind": model.kind.copy(update={"lookback": 2})},
+    )
+
+    assert model.data_hash == updated_model.data_hash
+    assert model.metadata_hash != updated_model.metadata_hash
+    assert updated_model.is_metadata_only_change(model)
+
+
 def test_transitive_dependency_of_metadata_only_object_is_metadata_only(tmp_path: Path) -> None:
     init_example_project(tmp_path, engine_type="duckdb", template=ProjectTemplate.EMPTY)
 

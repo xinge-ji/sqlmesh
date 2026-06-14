@@ -431,7 +431,6 @@ class _IncrementalBy(_Incremental):
         return [
             *super().data_hash_values,
             self.dialect,
-            str(self.lookback) if self.lookback is not None else None,
         ]
 
     @property
@@ -439,6 +438,7 @@ class _IncrementalBy(_Incremental):
         return [
             *super().metadata_hash_values,
             str(self.batch_size) if self.batch_size is not None else None,
+            str(self.lookback) if self.lookback is not None else None,
             str(self.forward_only),
             str(self.disable_restatement),
         ]
@@ -990,7 +990,6 @@ class CustomKind(_ModelKind):
             *super().data_hash_values,
             self.materialization,
             gen(self.materialization_properties_) if self.materialization_properties_ else None,
-            str(self.lookback) if self.lookback is not None else None,
         ]
 
     @property
@@ -999,6 +998,7 @@ class CustomKind(_ModelKind):
             *super().metadata_hash_values,
             str(self.batch_size) if self.batch_size is not None else None,
             str(self.batch_concurrency) if self.batch_concurrency is not None else None,
+            str(self.lookback) if self.lookback is not None else None,
             str(self.forward_only),
             str(self.disable_restatement),
             self.auto_restatement_cron,
