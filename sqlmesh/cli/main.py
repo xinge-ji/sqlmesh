@@ -510,7 +510,7 @@ def diff(ctx: click.Context, environment: t.Optional[str] = None) -> None:
 @click.option(
     "--run",
     is_flag=True,
-    help="Run latest intervals as part of the plan application (prod environment only).",
+    help="Run latest intervals as part of the plan application.",
     default=None,
 )
 @click.option(

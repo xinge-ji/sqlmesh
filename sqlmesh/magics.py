@@ -492,7 +492,7 @@ class SQLMeshMagics(Magics):
     @argument(
         "--run",
         action="store_true",
-        help="Run latest intervals as part of the plan application (prod environment only).",
+        help="Run latest intervals as part of the plan application.",
     )
     @argument(
         "--ignore-cron",
