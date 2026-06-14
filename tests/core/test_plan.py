@@ -3181,6 +3181,35 @@ def test_unsupported_doris_aggregate_key_change_is_unknown_physical_property(mak
     assert request.propagates_downstream
     assert request.breaking
 
+
+def test_doris_materialized_view_key_change_requires_physical_recreation(make_snapshot):
+    old_snapshot = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, ds"),
+            kind=ViewKind(materialized=True),
+            dialect="doris",
+            physical_properties=d.parse_one("(unique_key = id)"),
+        )
+    )
+    new_snapshot = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, ds"),
+            kind=ViewKind(materialized=True),
+            dialect="doris",
+            physical_properties=d.parse_one("(unique_key = (id, ds))"),
+        )
+    )
+
+    plan = PlanBuilder(_doris_recreation_context_diff(new_snapshot, old_snapshot)).build()
+
+    request = plan.physical_recreation_requests[new_snapshot.snapshot_id]
+    assert request.reason == PhysicalRecreationReason.DORIS_SEMANTIC_KEY
+    assert request.propagates_downstream
+    assert request.breaking
+
+
 def _doris_recreation_context_diff(new_snapshot: Snapshot, old_snapshot: Snapshot) -> ContextDiff:
     return ContextDiff(
         environment="test_environment",

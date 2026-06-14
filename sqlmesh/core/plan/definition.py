@@ -31,7 +31,7 @@ from sqlmesh.core.snapshot.definition import (
     format_intervals,
 )
 from sqlmesh.utils.date import TimeLike, now, to_datetime, to_timestamp
-from sqlmesh.utils.pydantic import PydanticModel, model_validator
+from sqlmesh.utils.pydantic import PydanticModel, field_serializer, model_validator
 
 SnapshotMapping = t.Dict[SnapshotId, t.Set[SnapshotId]]
 UserProvidedFlags = t.Union[TimeLike, str, bool, t.List[str]]
@@ -372,9 +372,13 @@ class EvaluatablePlan(PydanticModel):
     def _physical_recreation_requests_compat(cls, data: t.Any) -> t.Any:
         if not isinstance(data, dict):
             return data
+        data = data.copy()
+        if "physical_recreation_requests" in data:
+            data["physical_recreation_requests"] = cls._physical_recreation_requests_from_value(
+                data["physical_recreation_requests"]
+            )
         if "snapshots_requiring_physical_recreation" not in data:
             return data
-        data = data.copy()
         snapshot_ids = data.pop("snapshots_requiring_physical_recreation") or set()
         if "physical_recreation_requests" in data:
             return data
@@ -389,6 +393,57 @@ class EvaluatablePlan(PydanticModel):
             for snapshot_id in snapshot_ids
         }
         return data
+
+    @classmethod
+    def _physical_recreation_requests_from_value(cls, value: t.Any) -> t.Any:
+        # Runtime callers use a SnapshotId-keyed dict, but JSON writes a list because
+        # object keys cannot preserve SnapshotId structure. Dict input is legacy read-only
+        # compatibility and the request payload remains the source of truth.
+        if isinstance(value, list):
+            return cls._physical_recreation_requests_from_iterable(value)
+        if isinstance(value, dict):
+            return cls._physical_recreation_requests_from_dict(value)
+        return value
+
+    @classmethod
+    def _physical_recreation_requests_from_iterable(
+        cls, requests: t.Iterable[t.Any]
+    ) -> t.Dict[SnapshotId, PhysicalRecreationRequest]:
+        return {
+            request.snapshot_id: request
+            for request in (
+                value
+                if isinstance(value, PhysicalRecreationRequest)
+                else PhysicalRecreationRequest.parse_obj(value)
+                for value in requests
+            )
+        }
+
+    @classmethod
+    def _physical_recreation_requests_from_dict(
+        cls, requests: t.Dict[t.Any, t.Any]
+    ) -> t.Dict[SnapshotId, PhysicalRecreationRequest]:
+        result = {}
+        for snapshot_id, value in requests.items():
+            request = (
+                value
+                if isinstance(value, PhysicalRecreationRequest)
+                else PhysicalRecreationRequest.parse_obj(value)
+            )
+            request_snapshot_id = (
+                snapshot_id if isinstance(snapshot_id, SnapshotId) else request.snapshot_id
+            )
+            result[request_snapshot_id] = request
+        return result
+
+    @field_serializer("physical_recreation_requests", when_used="json")
+    def _serialize_physical_recreation_requests(
+        self, requests: t.Dict[SnapshotId, PhysicalRecreationRequest]
+    ) -> t.List[PhysicalRecreationRequest]:
+        return sorted(
+            requests.values(),
+            key=lambda request: (request.snapshot_id.name, request.snapshot_id.identifier),
+        )
 
     @property
     def snapshots_requiring_physical_recreation(self) -> t.Set[SnapshotId]:

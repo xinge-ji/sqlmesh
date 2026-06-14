@@ -4345,8 +4345,54 @@ def _load_doris_model_with_key(key_property: str, query: str = "SELECT id, name 
     )
 
 
+def _load_doris_materialized_view_with_key(
+    key_property: str, query: str = "SELECT id, name FROM source"
+):
+    return load_sql_based_model(
+        d.parse(
+            f"""
+            MODEL (
+                name db.test_model,
+                kind VIEW (materialized true),
+                dialect doris,
+                physical_properties (
+                    {key_property}
+                )
+            );
+            {query};
+            """
+        )
+    )
+
+
 @pytest.mark.parametrize("key_property", ["unique_key", "duplicate_key"])
 def test_doris_key_physical_property_column_must_exist(key_property: str) -> None:
+    sql_model = _load_doris_model_with_key(f"{key_property} = goods_id")
+
+    with pytest.raises(ConfigError) as ex:
+        sql_model.validate_definition()
+
+    error = str(ex.value)
+    assert "Doris key columns ['goods_id'] for model 'db.test_model'" in error
+    assert "rendered output columns ['id', 'name']" in error
+
+
+@pytest.mark.parametrize("key_property", ["unique_key", "duplicate_key"])
+def test_doris_materialized_view_key_physical_property_column_must_exist(
+    key_property: str,
+) -> None:
+    sql_model = _load_doris_materialized_view_with_key(f"{key_property} = goods_id")
+
+    with pytest.raises(ConfigError) as ex:
+        sql_model.validate_definition()
+
+    error = str(ex.value)
+    assert "Doris key columns ['goods_id'] for model 'db.test_model'" in error
+    assert "rendered output columns ['id', 'name']" in error
+
+
+@pytest.mark.parametrize("key_property", ["UNIQUE_KEY", "Duplicate_Key"])
+def test_doris_key_physical_property_name_is_case_insensitive(key_property: str) -> None:
     sql_model = _load_doris_model_with_key(f"{key_property} = goods_id")
 
     with pytest.raises(ConfigError) as ex:
@@ -4364,11 +4410,27 @@ def test_doris_aggregate_key_physical_property_is_rejected_until_supported() -> 
         sql_model.validate_definition()
 
 
+def test_doris_aggregate_key_physical_property_name_is_case_insensitively_rejected() -> None:
+    sql_model = _load_doris_model_with_key("AGGREGATE_KEY = goods_id")
+
+    with pytest.raises(ConfigError, match="Doris aggregate_key physical property is not supported"):
+        sql_model.validate_definition()
+
+
 def test_doris_key_physical_property_validation_is_case_and_quote_insensitive() -> None:
     sql_model = _load_doris_model_with_key(
         "unique_key = `goods_id`",
         "SELECT 1 AS Goods_ID, 2 AS Name",
     )
+
+    sql_model.validate_definition()
+
+
+@pytest.mark.parametrize("key_property", ["unique_key", "duplicate_key"])
+def test_doris_materialized_view_key_physical_property_validation_passes(
+    key_property: str,
+) -> None:
+    sql_model = _load_doris_materialized_view_with_key(f"{key_property} = id")
 
     sql_model.validate_definition()
 

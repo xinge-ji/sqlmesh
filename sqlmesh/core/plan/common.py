@@ -118,12 +118,12 @@ _DORIS_RETENTION_PHYSICAL_PROPERTIES = {
 def physical_recreation_request(
     old: Snapshot, new: Snapshot
 ) -> t.Optional[PhysicalRecreationRequest]:
-    """Returns a reason-aware request for recreating a Doris physical table."""
+    """Returns a reason-aware request for recreating a Doris physical object."""
     if not new.is_model or not old.is_model:
         return None
     if new.model.dialect != "doris" or old.model.dialect != "doris":
         return None
-    if not new.model.kind.is_materialized:
+    if not _is_doris_physical_recreation_target(new):
         return None
 
     changed_properties = _changed_physical_properties(new, old)
@@ -148,6 +148,10 @@ def physical_recreation_request(
 def requires_physical_recreation(old: Snapshot, new: Snapshot) -> bool:
     """Returns whether a physical property change requires a new physical table."""
     return physical_recreation_request(old, new) is not None
+
+
+def _is_doris_physical_recreation_target(snapshot: Snapshot) -> bool:
+    return snapshot.model.kind.is_materialized or snapshot.is_materialized_view
 
 
 def _doris_physical_recreation_reason(

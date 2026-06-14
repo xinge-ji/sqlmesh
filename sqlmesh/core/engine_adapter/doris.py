@@ -46,6 +46,48 @@ logger = logging.getLogger(__name__)
 _DORIS_KEY_PHYSICAL_PROPERTY_NAMES = ("unique_key", "duplicate_key")
 
 
+def _normalize_doris_physical_property_key(key: str) -> str:
+    normalized = str(key).strip()
+    while len(normalized) >= 2 and normalized[0] == normalized[-1] and normalized[0] in {
+        '"',
+        "`",
+    }:
+        normalized = normalized[1:-1].strip()
+    return normalized.lower()
+
+
+def _matching_doris_physical_property_key(
+    physical_properties: t.Mapping[str, t.Any],
+    property_name: str,
+) -> t.Optional[str]:
+    normalized_property_name = _normalize_doris_physical_property_key(property_name)
+    matching_key = None
+    for key in physical_properties:
+        if _normalize_doris_physical_property_key(key) == normalized_property_name:
+            if matching_key is not None:
+                raise SQLMeshError(
+                    f"Duplicate Doris physical property '{key}' conflicts with '{matching_key}' after case-insensitive normalization."
+                )
+            matching_key = key
+    return matching_key
+
+
+def _get_doris_physical_property(
+    physical_properties: t.Mapping[str, t.Any],
+    property_name: str,
+) -> t.Optional[t.Any]:
+    matching_key = _matching_doris_physical_property_key(physical_properties, property_name)
+    return physical_properties[matching_key] if matching_key is not None else None
+
+
+def _pop_doris_physical_property(
+    physical_properties: t.MutableMapping[str, t.Any],
+    property_name: str,
+) -> t.Optional[t.Any]:
+    matching_key = _matching_doris_physical_property_key(physical_properties, property_name)
+    return physical_properties.pop(matching_key) if matching_key is not None else None
+
+
 def _doris_key_columns(expression: t.Any) -> t.List[str]:
     if isinstance(expression, exp.Paren):
         return _doris_key_columns(expression.this)
@@ -72,8 +114,9 @@ def doris_key_columns_from_physical_properties(
     """Extract Doris key columns from model-defined physical properties."""
     key_columns = {}
     for key_property in _DORIS_KEY_PHYSICAL_PROPERTY_NAMES:
-        if key_property in physical_properties:
-            key_columns[key_property] = _doris_key_columns(physical_properties[key_property])
+        property_value = _get_doris_physical_property(physical_properties, key_property)
+        if property_value is not None:
+            key_columns[key_property] = _doris_key_columns(property_value)
     return key_columns
 
 
@@ -91,7 +134,7 @@ def validate_doris_unsupported_key_properties(
     path: t.Optional[t.Any] = None,
 ) -> None:
     """Reject Doris key properties that SQLMesh does not render/validate yet."""
-    if "aggregate_key" in physical_properties:
+    if _get_doris_physical_property(physical_properties, "aggregate_key") is not None:
         raise_config_error(
             f"Doris aggregate_key physical property is not supported for model '{model_name}'. SQLMesh currently supports unique_key and duplicate_key.",
             path,
@@ -650,7 +693,7 @@ class DorisEngineAdapter(
         table_properties = kwargs.get("table_properties", {})
 
         # Convert primary_key to unique_key for Doris (Doris doesn't support primary keys)
-        if primary_key and "unique_key" not in table_properties:
+        if primary_key and _get_doris_physical_property(table_properties, "unique_key") is None:
             # Represent as a Tuple of columns to match downstream handling
             table_properties["unique_key"] = exp.Tuple(
                 expressions=[exp.to_column(col) for col in primary_key]
@@ -982,7 +1025,7 @@ class DorisEngineAdapter(
                 )
 
         # Handle unique_key / duplicate_key. Doris supports column-only key clauses.
-        unique_key = table_properties_copy.pop("unique_key", None)
+        unique_key = _pop_doris_physical_property(table_properties_copy, "unique_key")
         if unique_key is not None:
             unique_key_columns = _doris_key_columns(unique_key)
             properties.append(
@@ -990,7 +1033,7 @@ class DorisEngineAdapter(
             )
 
         # Both tables and materialized views support duplicate keys in Doris
-        duplicate_key = table_properties_copy.pop("duplicate_key", None)
+        duplicate_key = _pop_doris_physical_property(table_properties_copy, "duplicate_key")
         if duplicate_key is not None:
             duplicate_key_columns = _doris_key_columns(duplicate_key)
             properties.append(
@@ -1151,7 +1194,7 @@ class DorisEngineAdapter(
                     )
 
         # Only add generic properties if there are any left
-        if "aggregate_key" in table_properties_copy:
+        if _get_doris_physical_property(table_properties_copy, "aggregate_key") is not None:
             raise SQLMeshError(
                 "Doris aggregate_key physical property is not supported. SQLMesh currently supports unique_key and duplicate_key."
             )

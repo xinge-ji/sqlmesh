@@ -1,3 +1,4 @@
+import json
 import pytest
 import typing as t
 from sqlglot import parse_one
@@ -83,7 +84,6 @@ def snapshot_c(make_snapshot, snapshot_a: Snapshot) -> Snapshot:
     return snapshot
 
 
-
 def test_evaluatable_plan_accepts_legacy_physical_recreation_set(snapshot_a: Snapshot):
     environment = Environment(
         snapshots=[snapshot_a.table_info],
@@ -124,6 +124,63 @@ def test_evaluatable_plan_accepts_legacy_physical_recreation_set(snapshot_a: Sna
     assert plan.snapshots_requiring_physical_recreation == {snapshot_a.snapshot_id}
     request = plan.physical_recreation_requests[snapshot_a.snapshot_id]
     assert request.reason == PhysicalRecreationReason.DORIS_SEMANTIC_KEY
+
+
+def test_evaluatable_plan_physical_recreation_requests_json_round_trip(snapshot_a: Snapshot):
+    environment = Environment(
+        snapshots=[snapshot_a.table_info],
+        start_at="2023-01-01",
+        end_at="2023-01-02",
+        plan_id="test_plan",
+        promoted_snapshot_ids=[snapshot_a.snapshot_id],
+    )
+    request = PhysicalRecreationRequest(
+        snapshot_id=snapshot_a.snapshot_id,
+        reason=PhysicalRecreationReason.DORIS_SEMANTIC_KEY,
+        propagates_downstream=True,
+        breaking=True,
+    )
+
+    plan = EvaluatablePlan(
+        start="2023-01-01",
+        end="2023-01-02",
+        new_snapshots=[snapshot_a],
+        environment=environment,
+        no_gaps=False,
+        skip_backfill=False,
+        empty_backfill=False,
+        restatements={},
+        restate_all_snapshots=False,
+        is_dev=False,
+        allow_destructive_models=set(),
+        allow_additive_models=set(),
+        forward_only=False,
+        end_bounded=False,
+        ensure_finalized_snapshots=False,
+        ignore_cron=False,
+        directly_modified_snapshots=[snapshot_a.snapshot_id],
+        indirectly_modified_snapshots={},
+        metadata_updated_snapshots=[],
+        removed_snapshots=[],
+        physical_recreation_requests={snapshot_a.snapshot_id: request},
+        requires_backfill=True,
+        models_to_backfill=None,
+        execution_time="2023-01-02",
+        disabled_restatement_models=set(),
+    )
+
+    payload = json.loads(plan.json())
+    assert payload["physical_recreation_requests"] == [request.dict()]
+
+    parsed = EvaluatablePlan.parse_raw(json.dumps(payload))
+    assert parsed.physical_recreation_requests == {snapshot_a.snapshot_id: request}
+
+    payload["physical_recreation_requests"] = {str(snapshot_a.snapshot_id): request.dict()}
+    parsed_legacy_bad_payload = EvaluatablePlan.parse_raw(json.dumps(payload))
+    assert parsed_legacy_bad_payload.physical_recreation_requests == {
+        snapshot_a.snapshot_id: request
+    }
+
 
 def test_build_plan_stages_basic(
     snapshot_a: Snapshot, snapshot_b: Snapshot, mocker: MockerFixture
@@ -2302,7 +2359,9 @@ def test_build_plan_stages_recreates_physical_property_changed_snapshot(
     new_snapshot = make_snapshot(
         SqlModel(
             name="test_model",
-            query=parse_one("select cast('2023-01-01' as date) as ds, 1 as store_id, 2 as goods_id"),
+            query=parse_one(
+                "select cast('2023-01-01' as date) as ds, 1 as store_id, 2 as goods_id"
+            ),
             kind=dict(name=ModelKindName.INCREMENTAL_BY_PARTITION),
             dialect="doris",
             partitioned_by=[parse_one("ds")],

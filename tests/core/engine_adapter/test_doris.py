@@ -36,6 +36,29 @@ def test_doris_key_columns_from_physical_properties_extracts_expression_forms():
     }
 
 
+def test_doris_key_columns_from_physical_properties_matches_names_case_insensitively():
+    assert doris_key_columns_from_physical_properties(
+        {
+            "UNIQUE_KEY": exp.to_column("id"),
+            "Duplicate_Key": exp.to_column("ds"),
+            "distributed_by": exp.Literal.string("id"),
+        }
+    ) == {
+        "unique_key": ["id"],
+        "duplicate_key": ["ds"],
+    }
+
+
+def test_doris_key_columns_from_physical_properties_rejects_duplicate_normalized_names():
+    with pytest.raises(SQLMeshError, match="Duplicate Doris physical property"):
+        doris_key_columns_from_physical_properties(
+            {
+                "unique_key": exp.to_column("id"),
+                "UNIQUE_KEY": exp.to_column("ds"),
+            }
+        )
+
+
 def test_create_view(make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter]):
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
     adapter.create_view("test_view", parse_one("SELECT a FROM tbl"))
@@ -176,6 +199,45 @@ def test_create_table_with_parenthesized_doris_keys(
     ]
 
 
+def test_create_table_with_case_insensitive_doris_key_properties(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    adapter.create_table(
+        "test_upper_unique_key",
+        target_columns_to_types={"id": exp.DataType.build("INT")},
+        table_properties={"UNIQUE_KEY": exp.to_column("id")},
+    )
+    adapter.create_table(
+        "test_mixed_duplicate_key",
+        target_columns_to_types={"id": exp.DataType.build("INT")},
+        table_properties={"Duplicate_Key": exp.to_column("id")},
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `test_upper_unique_key` (`id` INT) UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10",
+        "CREATE TABLE IF NOT EXISTS `test_mixed_duplicate_key` (`id` INT) DUPLICATE KEY (`id`)",
+    ]
+
+
+def test_create_table_primary_key_does_not_duplicate_case_insensitive_unique_key(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    adapter.create_table(
+        "test_upper_unique_key",
+        target_columns_to_types={"id": exp.DataType.build("INT")},
+        primary_key=("id",),
+        table_properties={"UNIQUE_KEY": exp.to_column("id")},
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `test_upper_unique_key` (`id` INT) UNIQUE KEY (`id`) DISTRIBUTED BY HASH (`id`) BUCKETS 10",
+    ]
+
+
 def test_create_table_with_parenthesized_unique_key_keeps_partition(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
 ):
@@ -220,8 +282,10 @@ def test_create_table_with_unsupported_doris_key_expression_errors(
 
 
 
+@pytest.mark.parametrize("key_property", ["aggregate_key", "AGGREGATE_KEY"])
 def test_create_table_with_unsupported_doris_aggregate_key_errors(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+    key_property: str,
 ):
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
 
@@ -229,7 +293,7 @@ def test_create_table_with_unsupported_doris_aggregate_key_errors(
         adapter.create_table(
             "test_table",
             target_columns_to_types={"id": exp.DataType.build("INT")},
-            table_properties={"aggregate_key": exp.to_column("id")},
+            table_properties={key_property: exp.to_column("id")},
         )
 
 def test_create_table_like(make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter]):

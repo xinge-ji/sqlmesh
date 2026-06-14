@@ -992,7 +992,9 @@ class _Model(ModelMeta, frozen=True):
                             self._path,
                         )
 
-        if self.dialect == "doris" and self.kind.is_materialized:
+        if self.dialect == "doris" and (
+            self.kind.is_materialized or (self.kind.is_view and self.kind.materialized)
+        ):
             from sqlmesh.core.engine_adapter.doris import (
                 validate_doris_key_columns,
                 validate_doris_unsupported_key_properties,
