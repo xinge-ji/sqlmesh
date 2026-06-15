@@ -89,6 +89,7 @@ from sqlmesh.core.notification_target import (
     NotificationTargetManager,
 )
 from sqlmesh.core.plan import Plan, PlanBuilder, SnapshotIntervals, PlanExplainer
+from sqlmesh.core.plan.common import physical_recreation_request
 from sqlmesh.core.plan.definition import UserProvidedFlags
 from sqlmesh.core.reference import ReferenceGraph
 from sqlmesh.core.scheduler import Scheduler, CompletionStatus
@@ -1573,6 +1574,7 @@ class GenericContext(BaseContext, t.Generic[C]):
         user_provided_flags: t.Dict[str, UserProvidedFlags] = {
             k: v for k, v in kwargs.items() if v is not None
         }
+        run_was_provided = run is not None
 
         skip_tests = explain or skip_tests or False
         no_gaps = no_gaps or False
@@ -1684,6 +1686,13 @@ class GenericContext(BaseContext, t.Generic[C]):
             *context_diff.modified_snapshots,
             *[s.name for s in context_diff.added],
         }
+
+        if (
+            not run_was_provided
+            and not (start or end or skip_backfill or empty_backfill)
+            and _requires_full_backfill_for_physical_recreation(context_diff)
+        ):
+            run = True
 
         if (
             is_dev
@@ -3328,6 +3337,14 @@ class GenericContext(BaseContext, t.Generic[C]):
             test_meta = filter_tests_by_patterns(test_meta, patterns)
 
         return test_meta
+
+
+def _requires_full_backfill_for_physical_recreation(context_diff: ContextDiff) -> bool:
+    return any(
+        request.requires_full_backfill
+        for new, old in context_diff.modified_snapshots.values()
+        if (request := physical_recreation_request(old, new)) is not None
+    )
 
 
 class Context(GenericContext[Config]):

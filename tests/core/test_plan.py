@@ -14,6 +14,7 @@ from sqlglot import parse_one, exp
 
 import sqlmesh.core.plan.builder as plan_builder
 from sqlmesh.core import dialect as d
+from sqlmesh.core.config import Config
 from sqlmesh.core.context import Context
 from sqlmesh.core.context_diff import ContextDiff
 from sqlmesh.core.environment import EnvironmentNamingInfo, EnvironmentStatements
@@ -3364,6 +3365,62 @@ def test_physical_recreation_rejects_model_specific_bounded_backfill(make_snapsh
                 new_snapshot.name: to_datetime("2023-01-01")
             },
         ).build()
+
+
+def test_context_plan_builder_auto_runs_doris_physical_recreation(make_snapshot, mocker):
+    new_snapshot, old_snapshot = _doris_recreation_snapshots(make_snapshot)
+    context = Context(config=Config())
+
+    mocker.patch.object(context, "lint_models")
+    mocker.patch.object(context, "_run_plan_tests")
+    mocker.patch.object(context, "_snapshots", return_value={new_snapshot.name: new_snapshot})
+    mocker.patch.object(
+        context,
+        "_context_diff",
+        return_value=_doris_recreation_context_diff(new_snapshot, old_snapshot),
+    )
+    mocker.patch.object(
+        context,
+        "_get_max_interval_end_per_model",
+        side_effect=AssertionError("auto-run plans should not infer a bounded default end"),
+    )
+
+    selector = mocker.Mock()
+    selector.expand_model_selections.return_value = set()
+    mocker.patch.object(context, "_new_selector", return_value=selector)
+
+    plan = context.plan_builder().build()
+
+    assert plan.end_bounded is False
+    assert plan.provided_end is None
+    assert "run" not in plan.user_provided_flags
+    assert plan.physical_recreation_requests[new_snapshot.snapshot_id].requires_full_backfill
+
+
+def test_context_plan_builder_respects_explicit_run_false_for_doris_recreation(
+    make_snapshot, mocker
+):
+    new_snapshot, old_snapshot = _doris_recreation_snapshots(make_snapshot)
+    context = Context(config=Config())
+
+    mocker.patch.object(context, "lint_models")
+    mocker.patch.object(context, "_run_plan_tests")
+    mocker.patch.object(context, "_snapshots", return_value={new_snapshot.name: new_snapshot})
+    mocker.patch.object(
+        context,
+        "_context_diff",
+        return_value=_doris_recreation_context_diff(new_snapshot, old_snapshot),
+    )
+    mocker.patch.object(context, "_get_max_interval_end_per_model", return_value={})
+    mocker.patch.object(context, "_get_plan_default_start_end", return_value=(None, None))
+    mocker.patch.object(context.state_sync, "refresh_snapshot_intervals")
+
+    selector = mocker.Mock()
+    selector.expand_model_selections.return_value = set()
+    mocker.patch.object(context, "_new_selector", return_value=selector)
+
+    with pytest.raises(PlanError, match="Cannot apply a bounded backfill.*doris_semantic_key"):
+        context.plan_builder(run=False).build()
 
 
 def test_non_column_level_change_propagates_to_all_downstream(make_snapshot):
