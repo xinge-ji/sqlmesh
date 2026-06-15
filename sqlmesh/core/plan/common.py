@@ -1,12 +1,13 @@
 from __future__ import annotations
 import typing as t
 import logging
-import re
 from enum import Enum
 from dataclasses import dataclass, field
 
-from sqlglot.optimizer.simplify import gen
-
+from sqlmesh.core.model.physical_properties import (
+    normalize_physical_property_key,
+    physical_property_value_gen,
+)
 from sqlmesh.core.state_sync import StateReader
 from sqlmesh.core.snapshot import Snapshot, SnapshotId, SnapshotIdAndVersion, SnapshotNameVersion
 from sqlmesh.core.snapshot.definition import Interval
@@ -208,7 +209,9 @@ def _physical_property_change_category(new: Snapshot, old: Snapshot) -> str:
 
 def _serialized_physical_properties(snapshot: Snapshot) -> t.Dict[str, str]:
     return {
-        _normalize_physical_property_key(key): gen(value)
+        normalize_physical_property_key(key): physical_property_value_gen(
+            snapshot.model.dialect, key, value
+        )
         for key, value in snapshot.model.physical_properties.items()
     }
 
@@ -266,8 +269,6 @@ def _physical_property_category(key: str) -> str:
     return _PHYSICAL_PROPERTY_UNKNOWN
 
 
-def _normalize_physical_property_key(key: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "_", key.lower()).strip("_")
 
 
 @dataclass

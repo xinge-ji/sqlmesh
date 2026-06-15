@@ -56,6 +56,14 @@ def _normalize_doris_physical_property_key(key: str) -> str:
     return normalized.lower()
 
 
+def _doris_distributed_by_config_key(expression: exp.Expression) -> t.Optional[str]:
+    if isinstance(expression, exp.Column):
+        return _normalize_doris_physical_property_key(expression.name)
+    if isinstance(expression, exp.Identifier):
+        return _normalize_doris_physical_property_key(expression.name)
+    return None
+
+
 def _matching_doris_physical_property_key(
     physical_properties: t.Mapping[str, t.Any],
     property_name: str,
@@ -1116,9 +1124,10 @@ class DorisEngineAdapter(
             if isinstance(distributed_by, exp.Tuple):
                 # Parse the Tuple with EQ expressions to extract distributed_by info
                 for expr in distributed_by.expressions:
-                    if isinstance(expr, exp.EQ) and hasattr(expr.this, "this"):
-                        # Remove quotes from the key if present
-                        key = str(expr.this.this).strip('"')
+                    if isinstance(expr, exp.EQ):
+                        key = _doris_distributed_by_config_key(expr.this)
+                        if key is None:
+                            continue
                         if isinstance(expr.expression, exp.Literal):
                             distributed_info[key] = expr.expression.this
                         elif isinstance(expr.expression, exp.Array):
@@ -1140,16 +1149,18 @@ class DorisEngineAdapter(
             elif isinstance(distributed_by, exp.Paren) and isinstance(distributed_by.this, exp.EQ):
                 # Handle single key-value pair in parentheses (e.g., (kind='RANDOM'))
                 expr = distributed_by.this
-                if hasattr(expr.this, "this"):
-                    # Remove quotes from the key if present
-                    key = str(expr.this.this).strip('"')
+                key = _doris_distributed_by_config_key(expr.this)
+                if key is not None:
                     if isinstance(expr.expression, exp.Literal):
                         distributed_info[key] = expr.expression.this
                     else:
                         distributed_info[key] = str(expr.expression)
             elif isinstance(distributed_by, dict):
                 # Handle as dictionary (legacy format)
-                distributed_info = distributed_by
+                distributed_info = {
+                    _normalize_doris_physical_property_key(key): value
+                    for key, value in distributed_by.items()
+                }
 
             # Create DistributedByProperty from parsed info
             if distributed_info:

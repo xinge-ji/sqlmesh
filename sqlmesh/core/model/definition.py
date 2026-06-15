@@ -32,6 +32,7 @@ from sqlmesh.core.model.common import (
     sorted_python_env_payloads,
     validate_extra_and_required_fields,
 )
+from sqlmesh.core.model.physical_properties import physical_property_value_gen
 from sqlmesh.core.model.meta import ModelMeta
 from sqlmesh.core.model.kind import (
     ExternalKind,
@@ -1190,7 +1191,7 @@ class _Model(ModelMeta, frozen=True):
 
         for key, value in (self.physical_properties or {}).items():
             data.append(key)
-            data.append(gen(value))
+            data.append(physical_property_value_gen(self.dialect, key, value))
 
         return data  # type: ignore
 

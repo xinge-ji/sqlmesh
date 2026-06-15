@@ -3044,6 +3044,70 @@ def test_layout_physical_property_change_does_not_propagate_downstream(make_snap
     assert not request.breaking
 
 
+def test_doris_distributed_by_config_key_quotes_do_not_recreate_physical_table(
+    make_snapshot,
+):
+    old_model = SqlModel(
+        name="a",
+        query=parse_one('select 1 as id, "Store_ID", ds'),
+        kind=FullKind(),
+        dialect="doris",
+        physical_properties=d.parse_one(
+            "(distributed_by = (kind = 'HASH', expressions = (\"Store_ID\", id), \"buckets\" = 1))"
+        ),
+    )
+    new_model = SqlModel(
+        name="a",
+        query=parse_one('select 1 as id, "Store_ID", ds'),
+        kind=FullKind(),
+        dialect="doris",
+        physical_properties=d.parse_one(
+            "(distributed_by = (kind = 'HASH', expressions = (\"Store_ID\", id), buckets = 1))"
+        ),
+    )
+    old_snapshot = make_snapshot(old_model)
+    new_snapshot = make_snapshot(new_model)
+
+    assert old_model.data_hash == new_model.data_hash
+
+    plan = PlanBuilder(_doris_recreation_context_diff(new_snapshot, old_snapshot)).build()
+
+    assert plan.physical_recreation_requests == {}
+
+
+def test_doris_distributed_by_bucket_value_change_recreates_physical_table(
+    make_snapshot,
+):
+    old_snapshot = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, ds"),
+            kind=FullKind(),
+            dialect="doris",
+            physical_properties=d.parse_one(
+                "(distributed_by = (kind = 'HASH', expressions = (id), \"buckets\" = 1))"
+            ),
+        )
+    )
+    new_snapshot = make_snapshot(
+        SqlModel(
+            name="a",
+            query=parse_one("select 1 as id, ds"),
+            kind=FullKind(),
+            dialect="doris",
+            physical_properties=d.parse_one(
+                "(distributed_by = (kind = 'HASH', expressions = (id), buckets = 2))"
+            ),
+        )
+    )
+
+    plan = PlanBuilder(_doris_recreation_context_diff(new_snapshot, old_snapshot)).build()
+
+    request = plan.physical_recreation_requests[new_snapshot.snapshot_id]
+    assert request.reason == PhysicalRecreationReason.DORIS_LAYOUT_DISTRIBUTION
+    assert not request.propagates_downstream
+
+
 
 def test_layout_storage_physical_property_change_does_not_propagate_downstream(make_snapshot):
     snapshot_a = make_snapshot(

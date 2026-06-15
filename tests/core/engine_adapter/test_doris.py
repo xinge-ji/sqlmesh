@@ -427,6 +427,47 @@ def test_create_table_with_distributed_by(
     ]
 
 
+def test_create_table_with_quoted_distributed_by_config_keys(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+
+    adapter.create_table(
+        "test_table",
+        target_columns_to_types={
+            "Store_ID": exp.DataType.build("INT"),
+            "id": exp.DataType.build("INT"),
+        },
+        table_properties={
+            "distributed_by": exp.Tuple(
+                expressions=[
+                    exp.EQ(
+                        this=exp.Column(this=exp.Identifier(this="KIND", quoted=True)),
+                        expression=exp.Literal.string("HASH"),
+                    ),
+                    exp.EQ(
+                        this=exp.Column(this=exp.Identifier(this="EXPRESSIONS", quoted=True)),
+                        expression=exp.Tuple(
+                            expressions=[
+                                exp.Column(this=exp.Identifier(this="Store_ID", quoted=True)),
+                                exp.to_column("id"),
+                            ]
+                        ),
+                    ),
+                    exp.EQ(
+                        this=exp.Column(this=exp.Identifier(this="BUCKETS", quoted=True)),
+                        expression=exp.Literal.number(1),
+                    ),
+                ]
+            ),
+        },
+    )
+
+    assert to_sql_calls(adapter) == [
+        "CREATE TABLE IF NOT EXISTS `test_table` (`Store_ID` INT, `id` INT) DISTRIBUTED BY HASH (`Store_ID`, `id`) BUCKETS 1",
+    ]
+
+
 def test_create_table_with_properties(
     make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
 ):
