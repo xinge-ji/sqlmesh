@@ -204,6 +204,7 @@ class DorisEngineAdapter(
     MAX_IDENTIFIER_LENGTH = None
     SUPPORTS_MATERIALIZED_VIEWS = True
     SUPPORTS_MATERIALIZED_VIEW_SCHEMA = True
+    RECREATE_MATERIALIZED_VIEW_ON_EVALUATION = False
     SUPPORTS_CREATE_DROP_CATALOG = False
     INSERT_OVERWRITE_STRATEGY = InsertOverwriteStrategy.DELETE_INSERT
 
@@ -329,6 +330,9 @@ class DorisEngineAdapter(
         **create_kwargs: t.Any,
     ) -> None:
         if replace:
+            self.drop_data_object_on_type_mismatch(
+                self.get_data_object(view_name), DataObjectType.MATERIALIZED_VIEW
+            )
             self.drop_view(
                 view_name,
                 ignore_if_not_exists=True,
