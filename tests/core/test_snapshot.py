@@ -1032,9 +1032,10 @@ def test_fingerprint(model: Model, parent_model: Model):
     assert fingerprint.metadata_hash != original_fingerprint.metadata_hash
 
 
-def test_fingerprint_does_not_fan_out_on_parent_metadata_change(
+def test_fingerprint_fans_out_on_parent_metadata_change_without_data_version_change(
     model: Model, parent_model: Model
 ):
+    original_parent_fingerprint = fingerprint_from_node(parent_model, nodes={})
     fingerprint = fingerprint_from_node(
         model,
         nodes={parent_model.fqn: parent_model, model.fqn: model},
@@ -1047,8 +1048,13 @@ def test_fingerprint_does_not_fan_out_on_parent_metadata_change(
         nodes={updated_parent.fqn: updated_parent, model.fqn: model},
     )
 
-    assert updated_parent_fingerprint != fingerprint_from_node(parent_model, nodes={})
-    assert updated_fingerprint == fingerprint
+    assert updated_parent_fingerprint != original_parent_fingerprint
+    assert updated_parent_fingerprint.to_version() == original_parent_fingerprint.to_version()
+    assert updated_fingerprint != fingerprint
+    assert updated_fingerprint.data_hash == fingerprint.data_hash
+    assert updated_fingerprint.parent_data_hash == fingerprint.parent_data_hash
+    assert updated_fingerprint.parent_metadata_hash != fingerprint.parent_metadata_hash
+    assert updated_fingerprint.to_version() == fingerprint.to_version()
 
 
 def test_fingerprint_seed_model():
