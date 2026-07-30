@@ -2352,6 +2352,29 @@ class RisingwaveConnectionConfig(ConnectionConfig):
         return init
 
 
+class DorisPartitionWatermarkConfig(BaseConfig):
+    low: int = Field(gt=0)
+    high: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _validate_watermarks(self) -> Self:
+        if self.high <= self.low:
+            raise ConfigError("Doris partition replenishment high watermark must exceed low watermark")
+        return self
+
+
+class DorisPartitionReplenishmentConfig(BaseConfig):
+    day: DorisPartitionWatermarkConfig = Field(
+        default_factory=lambda: DorisPartitionWatermarkConfig(low=7, high=14)
+    )
+    month: DorisPartitionWatermarkConfig = Field(
+        default_factory=lambda: DorisPartitionWatermarkConfig(low=2, high=3)
+    )
+    year: DorisPartitionWatermarkConfig = Field(
+        default_factory=lambda: DorisPartitionWatermarkConfig(low=2, high=3)
+    )
+
+
 class DorisConnectionConfig(ConnectionConfig):
     """Configuration for the Apache Doris connection."""
 
@@ -2368,6 +2391,9 @@ class DorisConnectionConfig(ConnectionConfig):
     register_comments: bool = True
     local_infile: bool = False
     pre_ping: bool = True
+    partition_replenishment: DorisPartitionReplenishmentConfig = Field(
+        default_factory=DorisPartitionReplenishmentConfig
+    )
 
     type_: t.Literal["doris"] = Field(alias="type", default="doris")
     DIALECT: t.ClassVar[t.Literal["doris"]] = "doris"
@@ -2400,6 +2426,17 @@ class DorisConnectionConfig(ConnectionConfig):
     @property
     def _engine_adapter(self) -> t.Type[EngineAdapter]:
         return engine_adapter.DorisEngineAdapter
+
+    @property
+    def _extra_engine_config(self) -> t.Dict[str, t.Any]:
+        config = self.partition_replenishment
+        return {
+            "partition_replenishment_watermarks": {
+                "DAY": (config.day.low, config.day.high),
+                "MONTH": (config.month.low, config.month.high),
+                "YEAR": (config.year.low, config.year.high),
+            }
+        }
 
     @property
     def _connection_factory(self) -> t.Callable:

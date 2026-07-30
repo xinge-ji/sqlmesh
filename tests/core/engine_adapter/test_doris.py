@@ -1,4 +1,5 @@
 import typing as t
+from datetime import date, timedelta
 
 import pytest
 from sqlglot import expressions as exp
@@ -629,14 +630,23 @@ def test_ensure_range_partitions_adds_missing_month_partitions(
     mocker: MockerFixture,
 ):
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
-    mocker.patch.object(
+    fetchall = mocker.patch.object(
         adapter,
         "fetchall",
-        return_value=[
-            (
-                "p202606",
-                "types: [DATE]; keys: [2026-06-01]; types: [DATE]; keys: [2026-07-01];",
-            ),
+        side_effect=[
+            [
+                (
+                    "p202606",
+                    "types: [DATE]; keys: [2026-06-01]; types: [DATE]; keys: [2026-07-01];",
+                ),
+            ],
+            [
+                ("p202606", "[('2026-06-01'), ('2026-07-01'))"),
+                ("p202607", "[('2026-07-01'), ('2026-08-01'))"),
+                ("p202608", "[('2026-08-01'), ('2026-09-01'))"),
+                ("p202609", "[('2026-09-01'), ('2026-10-01'))"),
+                ("p202610", "[('2026-10-01'), ('2026-11-01'))"),
+            ],
         ],
     )
 
@@ -648,7 +658,11 @@ def test_ensure_range_partitions_adds_missing_month_partitions(
 
     assert to_sql_calls(adapter) == [
         "ALTER TABLE `test_schema`.`test_table` ADD PARTITION IF NOT EXISTS `p202607` VALUES [('2026-07-01'), ('2026-08-01'))",
+        "ALTER TABLE `test_schema`.`test_table` ADD PARTITION IF NOT EXISTS `p202608` VALUES [('2026-08-01'), ('2026-09-01'))",
+        "ALTER TABLE `test_schema`.`test_table` ADD PARTITION IF NOT EXISTS `p202609` VALUES [('2026-09-01'), ('2026-10-01'))",
+        "ALTER TABLE `test_schema`.`test_table` ADD PARTITION IF NOT EXISTS `p202610` VALUES [('2026-10-01'), ('2026-11-01'))",
     ]
+    assert fetchall.call_count == 2
 
 
 def test_ensure_range_partitions_adds_missing_day_partition_for_non_midnight_end(
@@ -656,14 +670,25 @@ def test_ensure_range_partitions_adds_missing_day_partition_for_non_midnight_end
     mocker: MockerFixture,
 ):
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
-    mocker.patch.object(
+    first_day = date(2026, 6, 1)
+    final_rows = [
+        (
+            f"p{start:%Y%m%d}",
+            f"[('{start:%Y-%m-%d}'), ('{start + timedelta(days=1):%Y-%m-%d}'))",
+        )
+        for start in (first_day + timedelta(days=offset) for offset in range(16))
+    ]
+    fetchall = mocker.patch.object(
         adapter,
         "fetchall",
-        return_value=[
-            (
-                "p20260601",
-                "types: [DATE]; keys: [2026-06-01]; types: [DATE]; keys: [2026-06-02];",
-            ),
+        side_effect=[
+            [
+                (
+                    "p20260601",
+                    "types: [DATE]; keys: [2026-06-01]; types: [DATE]; keys: [2026-06-02];",
+                ),
+            ],
+            final_rows,
         ],
     )
 
@@ -673,9 +698,72 @@ def test_ensure_range_partitions_adds_missing_day_partition_for_non_midnight_end
         [("2026-06-01 00:00:00", "2026-06-02 12:00:00")],
     )
 
-    assert to_sql_calls(adapter) == [
-        "ALTER TABLE `test_schema`.`test_table` ADD PARTITION IF NOT EXISTS `p20260602` VALUES [('2026-06-02'), ('2026-06-03'))",
-    ]
+    sql_calls = to_sql_calls(adapter)
+    assert len(sql_calls) == 15
+    assert sql_calls[0] == (
+        "ALTER TABLE `test_schema`.`test_table` ADD PARTITION IF NOT EXISTS `p20260602` "
+        "VALUES [('2026-06-02'), ('2026-06-03'))"
+    )
+    assert sql_calls[-1] == (
+        "ALTER TABLE `test_schema`.`test_table` ADD PARTITION IF NOT EXISTS `p20260616` "
+        "VALUES [('2026-06-16'), ('2026-06-17'))"
+    )
+    assert all(" ADD PARTITION IF NOT EXISTS " in sql for sql in sql_calls)
+    assert fetchall.call_count == 2
+
+
+def test_ensure_range_partitions_rounds_watermarks_to_complete_three_day_periods(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+    mocker: MockerFixture,
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    first_start = date(2026, 5, 31)
+
+    def partition_rows(periods: int) -> t.List[t.Tuple[str, str]]:
+        return [
+            (
+                f"p{start:%Y%m%d}",
+                f"[('{start:%Y-%m-%d}'), ('{start + timedelta(days=3):%Y-%m-%d}'))",
+            )
+            for start in (first_start + timedelta(days=3 * offset) for offset in range(periods))
+        ]
+
+    through_june_18 = partition_rows(6)
+    fetchall = mocker.patch.object(
+        adapter,
+        "fetchall",
+        side_effect=[
+            partition_rows(1),
+            through_june_18,
+            through_june_18,
+            partition_rows(8),
+        ],
+    )
+
+    partition_text = "FROM ('2001-01-01') TO ('2099-12-31') INTERVAL 3 DAY"
+    adapter.ensure_range_partitions(
+        "test_schema.test_table",
+        partition_text,
+        [("2026-06-01", "2026-06-02")],
+    )
+    adapter.ensure_range_partitions(
+        "test_schema.test_table",
+        partition_text,
+        [("2026-06-07", "2026-06-08")],
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    assert len(sql_calls) == 7
+    assert sql_calls[0].endswith("VALUES [('2026-06-03'), ('2026-06-06'))")
+    assert sql_calls[4].endswith("VALUES [('2026-06-15'), ('2026-06-18'))")
+    assert sql_calls[5].endswith("VALUES [('2026-06-18'), ('2026-06-21'))")
+    assert sql_calls[6].endswith("VALUES [('2026-06-21'), ('2026-06-24'))")
+    partition_names = {
+        sql.split(" ADD PARTITION IF NOT EXISTS ", 1)[1].split(" ", 1)[0]
+        for sql in sql_calls
+    }
+    assert len(partition_names) == 7
+    assert fetchall.call_count == 4
 
 
 def test_ensure_range_partitions_skips_existing_covering_partition(
@@ -683,7 +771,7 @@ def test_ensure_range_partitions_skips_existing_covering_partition(
     mocker: MockerFixture,
 ):
     adapter = make_mocked_engine_adapter(DorisEngineAdapter)
-    mocker.patch.object(
+    fetchall = mocker.patch.object(
         adapter,
         "fetchall",
         return_value=[
@@ -698,6 +786,167 @@ def test_ensure_range_partitions_skips_existing_covering_partition(
     )
 
     assert to_sql_calls(adapter) == []
+    assert fetchall.call_count == 1
+
+
+def test_ensure_range_partitions_skips_replenishment_above_day_low_watermark(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+    mocker: MockerFixture,
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    first_day = date(2026, 6, 1)
+    existing_rows = [
+        (
+            f"p{start:%Y%m%d}",
+            f"[('{start:%Y-%m-%d}'), ('{start + timedelta(days=1):%Y-%m-%d}'))",
+        )
+        for start in (first_day + timedelta(days=offset) for offset in range(9))
+    ]
+    fetchall = mocker.patch.object(adapter, "fetchall", return_value=existing_rows)
+
+    adapter.ensure_range_partitions(
+        "test_schema.test_table",
+        "FROM ('2001-01-01') TO ('2099-12-31') INTERVAL 1 DAY",
+        [("2026-06-01", "2026-06-02")],
+    )
+
+    assert to_sql_calls(adapter) == []
+    assert fetchall.call_count == 1
+
+
+def test_ensure_range_partitions_replenishes_to_day_high_watermark_at_low_watermark(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+    mocker: MockerFixture,
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    first_day = date(2026, 6, 1)
+
+    def partition_rows(days: int) -> t.List[t.Tuple[str, str]]:
+        return [
+            (
+                f"p{start:%Y%m%d}",
+                f"[('{start:%Y-%m-%d}'), ('{start + timedelta(days=1):%Y-%m-%d}'))",
+            )
+            for start in (first_day + timedelta(days=offset) for offset in range(days))
+        ]
+
+    fetchall = mocker.patch.object(
+        adapter,
+        "fetchall",
+        side_effect=[partition_rows(8), partition_rows(15)],
+    )
+
+    adapter.ensure_range_partitions(
+        "test_schema.test_table",
+        "FROM ('2001-01-01') TO ('2099-12-31') INTERVAL 1 DAY",
+        [("2026-06-01", "2026-06-02")],
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    assert len(sql_calls) == 7
+    assert "`p20260609`" in sql_calls[0]
+    assert "`p20260615`" in sql_calls[-1]
+    assert fetchall.call_count == 2
+
+
+def test_ensure_range_partitions_uses_custom_day_watermarks(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+    mocker: MockerFixture,
+):
+    adapter = make_mocked_engine_adapter(
+        DorisEngineAdapter,
+        partition_replenishment_watermarks={"DAY": (10, 20)},
+    )
+    first_day = date(2026, 6, 1)
+
+    def partition_rows(days: int) -> t.List[t.Tuple[str, str]]:
+        return [
+            (
+                f"p{start:%Y%m%d}",
+                f"[('{start:%Y-%m-%d}'), ('{start + timedelta(days=1):%Y-%m-%d}'))",
+            )
+            for start in (first_day + timedelta(days=offset) for offset in range(days))
+        ]
+
+    fetchall = mocker.patch.object(
+        adapter,
+        "fetchall",
+        side_effect=[partition_rows(11), partition_rows(21)],
+    )
+
+    adapter.ensure_range_partitions(
+        "test_schema.test_table",
+        "FROM ('2001-01-01') TO ('2099-12-31') INTERVAL 1 DAY",
+        [("2026-06-01", "2026-06-02")],
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    assert len(sql_calls) == 10
+    assert "`p20260612`" in sql_calls[0]
+    assert "`p20260621`" in sql_calls[-1]
+    assert fetchall.call_count == 2
+
+
+def test_ensure_range_partitions_replenishes_contiguous_gap_despite_distant_partitions(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+    mocker: MockerFixture,
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    first_day = date(2026, 6, 1)
+
+    def row(start: date) -> t.Tuple[str, str]:
+        return (
+            f"p{start:%Y%m%d}",
+            f"[('{start:%Y-%m-%d}'), ('{start + timedelta(days=1):%Y-%m-%d}'))",
+        )
+
+    initial_rows = [row(first_day)] + [
+        row(first_day + timedelta(days=offset)) for offset in range(9, 21)
+    ]
+    final_rows = [row(first_day + timedelta(days=offset)) for offset in range(21)]
+    fetchall = mocker.patch.object(
+        adapter,
+        "fetchall",
+        side_effect=[initial_rows, final_rows],
+    )
+
+    adapter.ensure_range_partitions(
+        "test_schema.test_table",
+        "FROM ('2001-01-01') TO ('2099-12-31') INTERVAL 1 DAY",
+        [("2026-06-01", "2026-06-02")],
+    )
+
+    sql_calls = to_sql_calls(adapter)
+    assert len(sql_calls) == 8
+    assert "`p20260602`" in sql_calls[0]
+    assert "`p20260609`" in sql_calls[-1]
+    assert fetchall.call_count == 2
+
+
+def test_ensure_range_partitions_blocks_load_when_verification_fails(
+    make_mocked_engine_adapter: t.Callable[..., DorisEngineAdapter],
+    mocker: MockerFixture,
+):
+    adapter = make_mocked_engine_adapter(DorisEngineAdapter)
+    existing_rows = [("p202606", "[('2026-06-01'), ('2026-07-01'))")]
+    fetchall = mocker.patch.object(
+        adapter,
+        "fetchall",
+        side_effect=[existing_rows, existing_rows],
+    )
+
+    with pytest.raises(
+        SQLMeshError,
+        match=r"Doris range partition verification failed.*2026-07-01, 2026-08-01",
+    ):
+        adapter.ensure_range_partitions(
+            "test_schema.test_table",
+            "FROM ('2001-01-01') TO ('2099-12-31') INTERVAL 1 MONTH",
+            [("2026-06-01", "2026-07-01")],
+        )
+
+    assert fetchall.call_count == 2
+    assert len(to_sql_calls(adapter)) == 3
 
 
 def test_create_table_with_list_partitioned_by(

@@ -20,6 +20,17 @@ doris:
     # Optional MySQL-compatible settings
     charset: utf8mb4
     connect_timeout: 60
+    # Optional RANGE partition replenishment watermarks
+    partition_replenishment:
+      day:
+        low: 7
+        high: 14
+      month:
+        low: 2
+        high: 3
+      year:
+        low: 2
+        high: 3
   state_connection:
     # Use duckdb as state connection
     type: duckdb
@@ -122,6 +133,29 @@ MODEL (
 Doris table supports range partitioning and list partitioning to improve query performance.
 
 **Custom Partition Expression:**
+
+For interval-based range partitions, SQLMesh treats the configured `FROM` and `TO` values as
+stable model metadata and uses the `INTERVAL` count and unit as the physical partition template.
+During table creation, SQLMesh limits the physical partitions to the planned intervals plus the
+high watermark. A fixed distant `TO` value therefore does not create empty tablets through that
+date and does not need to be changed as time advances. If creation has no planned interval,
+SQLMesh uses the snapshot's recorded intervals, or the current physical period when the snapshot
+has no recorded interval, instead of falling back to the configured distant boundary.
+
+Before every load, including normal runs, backfills, restatements, and retries, SQLMesh reads
+`SHOW PARTITIONS` and verifies that the execution interval is covered. If continuous future
+coverage is above the low watermark, no partition is added. Once coverage reaches or falls below
+the low watermark, SQLMesh uses `ADD PARTITION IF NOT EXISTS` to replenish all missing partitions
+through the high watermark in one batch. It then reads `SHOW PARTITIONS` again and stops the load
+if any required range is still missing. Historical partitions are never removed automatically.
+
+The defaults are low/high values of 7/14 days, 2/3 months, and 2/3 years. For an `INTERVAL` larger
+than one unit, the effective low watermark is at least two physical partition periods and the
+effective high watermark is at least one physical period beyond the low watermark. Both values
+are rounded up to complete physical partition periods. Configure larger values when the
+failure-recovery SLA plus alert-handling time requires more future coverage. Watermarks are
+connection runtime settings, so changing them does not recreate model physical tables.
+
 ```sql
 MODEL (
   name my_partitioned_model,

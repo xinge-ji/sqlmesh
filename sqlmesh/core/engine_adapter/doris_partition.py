@@ -11,11 +11,22 @@ _DORIS_PARTITION_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _SUPPORTED_PARTITION_UNITS = {"DAY", "MONTH", "YEAR"}
+# Low and high watermarks are measured in the corresponding partition unit.
+_DEFAULT_REPLENISHMENT_WATERMARKS = {
+    "DAY": (7, 14),
+    "MONTH": (2, 3),
+    "YEAR": (2, 3),
+}
+
+PartitionReplenishmentWatermarks = t.Mapping[str, t.Tuple[int, int]]
 
 
 def doris_partition_bounds(
     partition_text: str,
     intervals: t.Iterable[t.Tuple[t.Any, t.Any]],
+    *,
+    include_future_buffer: bool = False,
+    replenishment_watermarks: t.Optional[PartitionReplenishmentWatermarks] = None,
 ) -> t.Optional[t.Tuple[date, date, int, str]]:
     match = _DORIS_PARTITION_RE.match(partition_text)
     if not match:
@@ -34,19 +45,65 @@ def doris_partition_bounds(
 
     from_dt = _floor_doris_partition_boundary(min(starts), unit, count)
     to_dt = _ceil_doris_partition_boundary(max(ends), unit, count)
+    if include_future_buffer:
+        _, to_dt = doris_partition_replenishment_bounds(
+            to_dt,
+            count,
+            unit,
+            replenishment_watermarks=replenishment_watermarks,
+        )
     return from_dt, to_dt, count, unit
 
 
 def doris_partition_text_for_intervals(
     partition_text: str,
     intervals: t.Iterable[t.Tuple[t.Any, t.Any]],
+    *,
+    replenishment_watermarks: t.Optional[PartitionReplenishmentWatermarks] = None,
 ) -> t.Optional[str]:
-    bounds = doris_partition_bounds(partition_text, intervals)
+    bounds = doris_partition_bounds(
+        partition_text,
+        intervals,
+        include_future_buffer=True,
+        replenishment_watermarks=replenishment_watermarks,
+    )
     if not bounds:
         return None
 
     from_dt, to_dt, count, unit = bounds
     return f"FROM ('{from_dt:%Y-%m-%d}') TO ('{to_dt:%Y-%m-%d}') INTERVAL {count} {unit}"
+
+
+def doris_partition_replenishment_bounds(
+    start: date,
+    count: int,
+    unit: str,
+    *,
+    replenishment_watermarks: t.Optional[PartitionReplenishmentWatermarks] = None,
+) -> t.Tuple[date, date]:
+    configured_low, configured_high = _partition_replenishment_watermarks(
+        unit,
+        replenishment_watermarks,
+    )
+    low_count = max(2 * count, _ceil_to_partition_period(configured_low, count))
+    high_count = max(low_count + count, _ceil_to_partition_period(configured_high, count))
+    return (
+        _add_doris_partition_interval(start, unit, low_count),
+        _add_doris_partition_interval(start, unit, high_count),
+    )
+
+
+def contiguous_partition_coverage_end(
+    start: date,
+    existing_ranges: t.Iterable[t.Tuple[date, date]],
+) -> date:
+    coverage_end = start
+    for range_start, range_end in sorted(existing_ranges):
+        if range_start > coverage_end:
+            break
+        if range_end > coverage_end:
+            coverage_end = range_end
+    return coverage_end
 
 
 def parse_doris_partition_range(text: str) -> t.Optional[t.Tuple[date, date]]:
@@ -108,6 +165,25 @@ def doris_partition_name(start: date, unit: str) -> str:
 
 def _covers_range(existing_range: t.Tuple[date, date], required_range: t.Tuple[date, date]) -> bool:
     return existing_range[0] <= required_range[0] and existing_range[1] >= required_range[1]
+
+
+def _partition_replenishment_watermarks(
+    unit: str,
+    replenishment_watermarks: t.Optional[PartitionReplenishmentWatermarks],
+) -> t.Tuple[int, int]:
+    configured = replenishment_watermarks.get(unit) if replenishment_watermarks else None
+    if (
+        not isinstance(configured, (list, tuple))
+        or len(configured) != 2
+        or not all(isinstance(value, int) and value > 0 for value in configured)
+        or configured[1] <= configured[0]
+    ):
+        return _DEFAULT_REPLENISHMENT_WATERMARKS[unit]
+    return configured[0], configured[1]
+
+
+def _ceil_to_partition_period(value: int, count: int) -> int:
+    return ((value + count - 1) // count) * count
 
 
 def _floor_doris_partition_boundary(dt: t.Any, unit: str, count: int) -> date:

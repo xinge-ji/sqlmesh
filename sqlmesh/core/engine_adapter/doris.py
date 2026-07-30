@@ -12,9 +12,12 @@ from sqlmesh.core.engine_adapter.base import (
     InsertOverwriteStrategy,
 )
 from sqlmesh.core.engine_adapter.doris_partition import (
+    PartitionReplenishmentWatermarks,
+    contiguous_partition_coverage_end,
     doris_partition_bounds,
     doris_partition_name,
     doris_partition_ranges,
+    doris_partition_replenishment_bounds,
     missing_partition_ranges,
     parse_doris_partition_range,
 )
@@ -207,6 +210,15 @@ class DorisEngineAdapter(
     RECREATE_MATERIALIZED_VIEW_ON_EVALUATION = False
     SUPPORTS_CREATE_DROP_CATALOG = False
     INSERT_OVERWRITE_STRATEGY = InsertOverwriteStrategy.DELETE_INSERT
+
+    @property
+    def partition_replenishment_watermarks(
+        self,
+    ) -> t.Optional[PartitionReplenishmentWatermarks]:
+        return t.cast(
+            t.Optional[PartitionReplenishmentWatermarks],
+            self._extra_config.get("partition_replenishment_watermarks"),
+        )
 
     def create_schema(
         self,
@@ -517,16 +529,60 @@ class DorisEngineAdapter(
         if not bounds:
             return
 
-        ranges_to_add = missing_partition_ranges(
-            doris_partition_ranges(bounds[0], bounds[1], bounds[2], bounds[3]),
-            self._existing_range_partition_ranges(table_name),
+        execution_ranges = doris_partition_ranges(
+            bounds[0],
+            bounds[1],
+            bounds[2],
+            bounds[3],
         )
+        existing_ranges = self._existing_range_partition_ranges(table_name)
+        ranges_to_add = missing_partition_ranges(
+            execution_ranges,
+            existing_ranges,
+        )
+
+        low_watermark_end, high_watermark_end = doris_partition_replenishment_bounds(
+            bounds[1],
+            bounds[2],
+            bounds[3],
+            replenishment_watermarks=self.partition_replenishment_watermarks,
+        )
+        coverage_end = contiguous_partition_coverage_end(bounds[1], existing_ranges)
+        verification_ranges = list(execution_ranges)
+        if coverage_end <= low_watermark_end:
+            future_ranges = doris_partition_ranges(
+                bounds[1],
+                high_watermark_end,
+                bounds[2],
+                bounds[3],
+            )
+            verification_ranges.extend(future_ranges)
+            for partition_range in missing_partition_ranges(future_ranges, existing_ranges):
+                if partition_range not in ranges_to_add:
+                    ranges_to_add.append(partition_range)
+
+        if not ranges_to_add:
+            return
+
         table_sql = exp.to_table(table_name).sql(dialect=self.dialect, identify=True)
         for start, end in ranges_to_add:
             self.execute(
                 f"ALTER TABLE {table_sql} ADD PARTITION IF NOT EXISTS "
                 f"{doris_partition_name(start, bounds[3])} VALUES "
                 f"[('{start:%Y-%m-%d}'), ('{end:%Y-%m-%d}'))"
+            )
+
+        missing_ranges = missing_partition_ranges(
+            verification_ranges,
+            self._existing_range_partition_ranges(table_name),
+        )
+        if missing_ranges:
+            formatted_ranges = ", ".join(
+                f"[{start:%Y-%m-%d}, {end:%Y-%m-%d})" for start, end in missing_ranges
+            )
+            raise SQLMeshError(
+                f"Doris range partition verification failed for table '{table_sql}'. "
+                f"Missing required ranges: {formatted_ranges}."
             )
 
     def _existing_range_partition_ranges(

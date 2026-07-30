@@ -2026,6 +2026,11 @@ def test_doris(make_config):
     assert config.DISPLAY_ORDER == 19
     assert config.is_recommended_for_state_sync is False
     assert config.is_forbidden_for_state_sync is True
+    assert config._extra_engine_config["partition_replenishment_watermarks"] == {
+        "DAY": (7, 14),
+        "MONTH": (2, 3),
+        "YEAR": (2, 3),
+    }
 
     # Test with minimal configuration (using default port)
     minimal_config = make_config(
@@ -2051,12 +2056,34 @@ def test_doris(make_config):
         charset="utf8mb4",
         ssl_disabled=True,
         concurrent_tasks=10,
+        partition_replenishment={
+            "day": {"low": 10, "high": 20},
+            "month": {"low": 3, "high": 5},
+        },
         check_import=False,
     )
     assert isinstance(advanced_config, DorisConnectionConfig)
     assert advanced_config.charset == "utf8mb4"
     assert advanced_config.ssl_disabled is True
     assert advanced_config.concurrent_tasks == 10
+    assert advanced_config._extra_engine_config["partition_replenishment_watermarks"] == {
+        "DAY": (10, 20),
+        "MONTH": (3, 5),
+        "YEAR": (2, 3),
+    }
+
+    with pytest.raises(
+        ConfigError,
+        match="Doris partition replenishment high watermark must exceed low watermark",
+    ):
+        make_config(
+            type="doris",
+            host="doris-fe",
+            user="admin",
+            password="admin123",
+            partition_replenishment={"day": {"low": 14, "high": 7}},
+            check_import=False,
+        )
 
 
 def test_starrocks(make_config):

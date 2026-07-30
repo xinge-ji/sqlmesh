@@ -20,6 +20,7 @@ from sqlmesh.core import dialect as d
 from sqlmesh.core.dialect import schema_, to_schema
 from sqlmesh.core.engine_adapter import EngineAdapter, create_engine_adapter, BigQueryEngineAdapter
 from sqlmesh.core.engine_adapter.base import MERGE_SOURCE_ALIAS, MERGE_TARGET_ALIAS
+from sqlmesh.core.engine_adapter.doris_partition import doris_partition_text_for_intervals
 from sqlmesh.core.engine_adapter.shared import (
     DataObject,
     DataObjectType,
@@ -70,10 +71,9 @@ from sqlmesh.core.snapshot.evaluator import (
     SCDType2Strategy,
     SnapshotCreationFailedError,
     ViewStrategy,
-    _dev_doris_partition_text,
-    _ensure_dev_doris_partitions_for_interval,
+    _ensure_doris_partitions_for_interval,
     _evaluation_interval,
-    _normalize_dev_doris_table_partitions,
+    _normalize_doris_table_partitions,
 )
 from sqlmesh.utils.concurrency import NodeExecutionFailedError
 from sqlmesh.utils.date import to_timestamp
@@ -5689,21 +5689,101 @@ def test_grants_in_production_with_dev_only_vde(
         assert sync_grants_mock.call_args[0][1] == {"select": ["user1"], "insert": ["role1"]}
 
 
-def test_dev_doris_partition_text_uses_interval_bounds() -> None:
+def test_doris_partition_text_uses_interval_bounds_and_month_buffer() -> None:
     intervals = [
         (to_timestamp("2026-05-01"), to_timestamp("2026-06-01")),
         (to_timestamp("2026-06-01"), to_timestamp("2026-06-06")),
     ]
 
     assert (
-        _dev_doris_partition_text(
+        doris_partition_text_for_intervals(
             "FROM ('2026-05-01') TO ('2049-12-31') INTERVAL 1 MONTH", intervals
         )
-        == "FROM ('2026-05-01') TO ('2026-07-01') INTERVAL 1 MONTH"
+        == "FROM ('2026-05-01') TO ('2026-10-01') INTERVAL 1 MONTH"
     )
 
 
-def test_dev_doris_partition_normalization_skips_prod_and_tmp(make_snapshot) -> None:
+@pytest.mark.parametrize(
+    ("partition_text", "expected"),
+    [
+        (
+            "FROM ('2000-01-01') TO ('2099-01-01') INTERVAL 1 DAY",
+            "FROM ('2026-06-01') TO ('2026-06-16') INTERVAL 1 DAY",
+        ),
+        (
+            "FROM ('2000-01-01') TO ('2099-01-01') INTERVAL 2 MONTH",
+            "FROM ('2026-05-01') TO ('2027-01-01') INTERVAL 2 MONTH",
+        ),
+        (
+            "FROM ('2000-01-01') TO ('2099-01-01') INTERVAL 3 DAY",
+            "FROM ('2026-05-31') TO ('2026-06-18') INTERVAL 3 DAY",
+        ),
+    ],
+)
+def test_doris_partition_buffer_uses_operational_window_or_two_physical_periods(
+    partition_text: str,
+    expected: str,
+) -> None:
+    assert (
+        doris_partition_text_for_intervals(
+            partition_text,
+            [(to_timestamp("2026-06-01"), to_timestamp("2026-06-02"))],
+        )
+        == expected
+    )
+
+
+def test_doris_partition_buffer_supports_runtime_watermark_configuration() -> None:
+    assert doris_partition_text_for_intervals(
+        "FROM ('2000-01-01') TO ('2099-01-01') INTERVAL 1 DAY",
+        [(to_timestamp("2026-06-01"), to_timestamp("2026-06-02"))],
+        replenishment_watermarks={"DAY": (10, 20)},
+    ) == "FROM ('2026-06-01') TO ('2026-06-22') INTERVAL 1 DAY"
+    assert doris_partition_text_for_intervals(
+        "FROM ('2000-01-01') TO ('2099-01-01') INTERVAL 3 DAY",
+        [(to_timestamp("2026-06-01"), to_timestamp("2026-06-02"))],
+        replenishment_watermarks={"DAY": (10, 20)},
+    ) == "FROM ('2026-05-31') TO ('2026-06-24') INTERVAL 3 DAY"
+
+
+def test_doris_partition_normalization_uses_adapter_watermarks(make_snapshot, mocker) -> None:
+    model = load_sql_based_model(
+        parse(
+            """
+            MODEL (
+                name test_schema.test_model,
+                dialect doris,
+                kind INCREMENTAL_BY_TIME_RANGE (time_column ds),
+                partitioned_by RANGE(ds)
+            );
+
+            SELECT ds::DATE FROM foo;
+            """
+        )
+    )
+    snapshot = make_snapshot(model)
+    adapter = mocker.Mock(partition_replenishment_watermarks={"DAY": (10, 20)})
+
+    properties = _normalize_doris_table_partitions(
+        snapshot=snapshot,
+        rendered_physical_properties={
+            "partitions": exp.Literal.string(
+                "FROM ('2000-01-01') TO ('2099-01-01') INTERVAL 1 DAY"
+            )
+        },
+        schema_migration_source=False,
+        intervals=[(to_timestamp("2026-06-01"), to_timestamp("2026-06-02"))],
+        adapter=adapter,
+    )
+
+    assert properties["partitions"].this == (
+        "FROM ('2026-06-01') TO ('2026-06-22') INTERVAL 1 DAY"
+    )
+
+
+def test_doris_partition_normalization_applies_to_prod_and_dev_but_skips_tmp(
+    make_snapshot,
+) -> None:
     model = load_sql_based_model(
         parse(
             """
@@ -5715,7 +5795,7 @@ def test_dev_doris_partition_normalization_skips_prod_and_tmp(make_snapshot) -> 
                 ),
                 partitioned_by RANGE(ds),
                 physical_properties (
-                    partitions = "FROM ('2001-01-01') TO ('2049-12-31') INTERVAL 1 MONTH"
+                    partitions = 'FROM (''2001-01-01'') TO (''2049-12-31'') INTERVAL 1 MONTH'
                 )
             );
 
@@ -5731,38 +5811,122 @@ def test_dev_doris_partition_normalization_skips_prod_and_tmp(make_snapshot) -> 
     }
     intervals = [(to_timestamp("2026-06-01"), to_timestamp("2026-06-06"))]
 
-    dev_properties = _normalize_dev_doris_table_partitions(
+    dev_properties = _normalize_doris_table_partitions(
         snapshot=snapshot,
         rendered_physical_properties=physical_properties,
-        is_snapshot_deployable=False,
         schema_migration_source=False,
         intervals=intervals,
     )
     assert (
         dev_properties["partitions"].this
-        == "FROM ('2026-06-01') TO ('2026-07-01') INTERVAL 1 MONTH"
+        == "FROM ('2026-06-01') TO ('2026-10-01') INTERVAL 1 MONTH"
     )
 
-    prod_properties = _normalize_dev_doris_table_partitions(
+    prod_properties = _normalize_doris_table_partitions(
         snapshot=snapshot,
         rendered_physical_properties=physical_properties,
-        is_snapshot_deployable=True,
         schema_migration_source=False,
         intervals=intervals,
     )
-    assert prod_properties is physical_properties
+    assert (
+        prod_properties["partitions"].this
+        == "FROM ('2026-06-01') TO ('2026-10-01') INTERVAL 1 MONTH"
+    )
+    assert prod_properties is not physical_properties
 
-    tmp_properties = _normalize_dev_doris_table_partitions(
+    tmp_properties = _normalize_doris_table_partitions(
         snapshot=snapshot,
         rendered_physical_properties=physical_properties,
-        is_snapshot_deployable=False,
         schema_migration_source=True,
         intervals=intervals,
     )
     assert tmp_properties is physical_properties
 
 
-def test_ensure_dev_doris_partitions_only_for_dev_doris(make_snapshot, mocker) -> None:
+@pytest.mark.parametrize(
+    (
+        "planned_intervals",
+        "snapshot_intervals",
+        "current_time",
+        "expected_partition_text",
+    ),
+    [
+        pytest.param(
+            [(to_timestamp("2026-06-01"), to_timestamp("2026-06-02"))],
+            [],
+            None,
+            "FROM ('2026-06-01') TO ('2026-06-16') INTERVAL 1 DAY",
+            id="planned_intervals",
+        ),
+        pytest.param(
+            None,
+            [(to_timestamp("2026-05-01"), to_timestamp("2026-06-01"))],
+            None,
+            "FROM ('2026-05-01') TO ('2026-06-15') INTERVAL 1 DAY",
+            id="snapshot_intervals",
+        ),
+        pytest.param(
+            None,
+            [],
+            "2026-06-01 12:00:00",
+            "FROM ('2026-06-01') TO ('2026-06-16') INTERVAL 1 DAY",
+            id="current_time",
+        ),
+    ],
+)
+def test_doris_create_snapshot_bounds_partition_layout_without_static_to(
+    adapter_mock,
+    make_snapshot,
+    mocker,
+    planned_intervals,
+    snapshot_intervals,
+    current_time,
+    expected_partition_text,
+) -> None:
+    adapter_mock.dialect = "doris"
+    adapter_mock.partition_replenishment_watermarks = None
+    if current_time:
+        mocker.patch("sqlmesh.core.snapshot.evaluator.now", return_value=current_time)
+
+    model = load_sql_based_model(
+        parse(
+            """
+            MODEL (
+                name test_schema.test_model,
+                dialect doris,
+                kind INCREMENTAL_BY_TIME_RANGE (time_column ds),
+                partitioned_by RANGE(ds),
+                physical_properties (
+                    partitions = 'FROM (''2000-01-01'') TO (''2099-01-01'') INTERVAL 1 DAY'
+                )
+            );
+
+            SELECT ds::DATE FROM foo;
+            """
+        )
+    )
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+    snapshot.intervals = snapshot_intervals
+    evaluator = SnapshotEvaluator(adapter_mock)
+
+    evaluator.create_snapshot(
+        snapshot=snapshot,
+        snapshots={},
+        deployability_index=DeployabilityIndex.all_deployable(),
+        allow_destructive_snapshots=set(),
+        allow_additive_snapshots=set(),
+        dev_table_intervals=planned_intervals,
+        force_recreate=current_time is not None,
+    )
+
+    table_properties = adapter_mock.create_table.call_args.kwargs["table_properties"]
+    assert table_properties["partitions"].this == expected_partition_text
+    if current_time:
+        adapter_mock.drop_table.assert_called_once_with(snapshot.table_name())
+
+
+def test_ensure_doris_partitions_for_prod_and_dev(make_snapshot, mocker) -> None:
     model = load_sql_based_model(
         parse(
             """
@@ -5774,7 +5938,7 @@ def test_ensure_dev_doris_partitions_only_for_dev_doris(make_snapshot, mocker) -
                 ),
                 partitioned_by RANGE(ds),
                 physical_properties (
-                    partitions = "FROM ('2001-01-01') TO ('2049-12-31') INTERVAL 1 MONTH"
+                    partitions = 'FROM (''2001-01-01'') TO (''2049-12-31'') INTERVAL 1 MONTH'
                 )
             );
 
@@ -5791,30 +5955,71 @@ def test_ensure_dev_doris_partitions_only_for_dev_doris(make_snapshot, mocker) -
     }
     interval = (to_timestamp("2026-06-01"), to_timestamp("2026-07-01"))
 
-    _ensure_dev_doris_partitions_for_interval(
-        adapter=adapter,
-        snapshot=snapshot,
-        target_table_name="test_table__dev",
-        rendered_physical_properties=physical_properties,
-        is_snapshot_deployable=False,
-        interval=interval,
+    for target_table_name in ("test_table__dev", "test_table"):
+        _ensure_doris_partitions_for_interval(
+            adapter=adapter,
+            snapshot=snapshot,
+            target_table_name=target_table_name,
+            rendered_physical_properties=physical_properties,
+            interval=interval,
+        )
+        adapter.ensure_range_partitions.assert_called_once_with(
+            target_table_name,
+            "FROM ('2001-01-01') TO ('2049-12-31') INTERVAL 1 MONTH",
+            [interval],
+        )
+        adapter.ensure_range_partitions.reset_mock()
+
+
+def test_doris_partition_verification_failure_prevents_load(
+    adapter_mock,
+    make_snapshot,
+) -> None:
+    adapter_mock.dialect = "doris"
+    adapter_mock.table_exists.return_value = True
+    adapter_mock.ensure_range_partitions.side_effect = SQLMeshError(
+        "Doris range partition verification failed"
     )
-    adapter.ensure_range_partitions.assert_called_once_with(
-        "test_table__dev",
-        "FROM ('2001-01-01') TO ('2049-12-31') INTERVAL 1 MONTH",
+    evaluator = SnapshotEvaluator(adapter_mock)
+    model = load_sql_based_model(
+        parse(
+            """
+            MODEL (
+                name test_schema.test_model,
+                dialect doris,
+                kind INCREMENTAL_BY_TIME_RANGE (
+                    time_column ds
+                ),
+                partitioned_by RANGE(ds),
+                physical_properties (
+                    partitions = 'FROM (''2001-01-01'') TO (''2099-12-31'') INTERVAL 1 MONTH'
+                )
+            );
+
+            SELECT ds::DATE FROM foo;
+            """
+        )
+    )
+    snapshot = make_snapshot(model)
+    snapshot.categorize_as(SnapshotChangeCategory.BREAKING)
+    snapshot.intervals = [(to_timestamp("2026-05-01"), to_timestamp("2026-06-01"))]
+    interval = (to_timestamp("2026-06-01"), to_timestamp("2026-07-01"))
+
+    with pytest.raises(SQLMeshError, match="Doris range partition verification failed"):
+        evaluator.evaluate(
+            snapshot,
+            start=interval[0],
+            end=interval[1],
+            execution_time=interval[1],
+            snapshots={},
+        )
+
+    adapter_mock.ensure_range_partitions.assert_called_once_with(
+        snapshot.table_name(),
+        "FROM ('2001-01-01') TO ('2099-12-31') INTERVAL 1 MONTH",
         [interval],
     )
-
-    adapter.ensure_range_partitions.reset_mock()
-    _ensure_dev_doris_partitions_for_interval(
-        adapter=adapter,
-        snapshot=snapshot,
-        target_table_name="test_table",
-        rendered_physical_properties=physical_properties,
-        is_snapshot_deployable=True,
-        interval=interval,
-    )
-    adapter.ensure_range_partitions.assert_not_called()
+    adapter_mock.insert_overwrite_by_time_partition.assert_not_called()
 
 
 def test_evaluation_interval_preserves_scheduler_half_open_interval(make_snapshot) -> None:
